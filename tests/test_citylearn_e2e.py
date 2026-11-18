@@ -36,9 +36,15 @@ CL = {
 }
 
 
+@pytest.mark.parametrize("timing_owner", ["mecosim", "energy_model"])
 @pytest.mark.parametrize("energy_kwh", [0.4, 1.0, 2.5])
-def test_exact_delivery_measured_by_citylearn(tmp_path: Path, energy_kwh: float) -> None:
-    built = tiny_built(tmp_path, **{**CL, "demand.ride_period_s": 5000, "simulation.duration_s": 1800})
+def test_exact_delivery_measured_by_citylearn(tmp_path: Path, energy_kwh: float, timing_owner: str) -> None:
+    if timing_owner == "energy_model":
+        pytest.importorskip("citylearn.internal.charger_dynamics")
+    built = tiny_built(
+        tmp_path,
+        **{**CL, "demand.ride_period_s": 5000, "simulation.duration_s": 1800, "energy.timing_owner": timing_owner},
+    )
 
     def fn(obs, state):  # type: ignore[no-untyped-def]
         if not state.get("sent") and obs.vehicles["av0"].in_simulation:
@@ -60,7 +66,12 @@ def test_exact_delivery_measured_by_citylearn(tmp_path: Path, energy_kwh: float)
     # between the planned power and the per-interval average power (partial intervals).
     assert -dis.measured_terminal_kwh == pytest.approx(energy_kwh, rel=0.01)
     assert -dis.measured_battery_kwh == pytest.approx(energy_kwh / eta, rel=0.02)
-    assert ch.measured_terminal_kwh == pytest.approx(1.5, rel=0.01)
+    if timing_owner == "mecosim":
+        assert ch.measured_terminal_kwh == pytest.approx(1.5, rel=0.01)
+    else:
+        # CityLearn's whole-step departure countdown: the stop instant is known only in the departure step, so a
+        # charge (no floor) may run at full power until then (docs/models.md); bounded by 22 s at 11 kW + a ramp.
+        assert 1.5 - 0.015 <= ch.measured_terminal_kwh <= 1.5 + (11.0 * 22.0 + 11.0**2 / (2 * 3.31)) / 3600.0
     ev = next(e for e in driver.env.electric_vehicles if e.name == "av0")
     soc = np.asarray(ev.battery.soc, dtype=float)[: driver.env.time_step]  # steps with a transition
     assert soc.min() >= dis.floor_soc - 1e-6
