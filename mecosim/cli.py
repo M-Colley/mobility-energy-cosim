@@ -65,7 +65,15 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
     cfg = SweepConfig.from_yaml(args.config)
     if args.seeds:
         cfg.seeds = [int(s) for s in args.seeds.split(",")]
-    frames = run_sweep(cfg, args.out, jobs=args.jobs, sumo_backend=args.backend, plot=not args.no_plot)
+    if args.analyze_only:
+        import pandas as pd
+
+        from mecosim.sweep import analyze
+
+        results = pd.read_csv(Path(args.out) / "results.csv")
+        frames = analyze(results, cfg.objectives, args.out, plot=not args.no_plot)
+    else:
+        frames = run_sweep(cfg, args.out, jobs=args.jobs, sumo_backend=args.backend, plot=not args.no_plot)
     summary = frames.get("summary")
     if summary is not None and not summary.empty:
         cols = ["label", "policy"] + [c for c in summary.columns if c.startswith("param.")] + list(cfg.objectives)
@@ -131,6 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--seeds", help="comma-separated seeds (overrides the file)")
     s.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
     s.add_argument("--no-plot", action="store_true")
+    s.add_argument(
+        "--analyze-only", action="store_true", help="recompute summary, Pareto set and plot from results.csv"
+    )
     s.set_defaults(func=_cmd_sweep)
 
     b = sub.add_parser("build", help="generate the SUMO files of a scenario")

@@ -143,7 +143,7 @@ def _run_job(job: dict[str, Any], base: dict[str, Any], out_dir: str, sumo_backe
 
 def summarize(results: pd.DataFrame) -> pd.DataFrame:
     """Mean and standard deviation over seeds per configuration (numeric columns)."""
-    ok = results[results["error"].fillna("") == ""]
+    ok = results[results["error"].astype("string").fillna("") == ""]
     keys = [c for c in ok.columns if c in ("config", "label", "policy") or c.startswith(("param.", "scenario."))]
     numeric = [c for c in ok.columns if c not in keys and c not in ("seed", "run_dir", "error")]
     numeric = [c for c in numeric if pd.api.types.is_numeric_dtype(ok[c])]
@@ -182,11 +182,26 @@ def run_sweep(
                 rows.append(fut.result())
     results = pd.DataFrame(rows).sort_values(["config", "seed"]).reset_index(drop=True)
     results.to_csv(out / "results.csv", index=False)
+    frames = analyze(results, cfg.objectives, out, plot=plot)
+    (out / "sweep.json").write_text(
+        json.dumps({"objectives": cfg.objectives, "seeds": cfg.seeds, "n_runs": len(all_jobs)}, indent=2),
+        encoding="utf-8",
+    )
+    return frames
+
+
+def analyze(
+    results: pd.DataFrame, objectives: Mapping[str, str], out_dir: str | Path, *, plot: bool = True
+) -> dict[str, pd.DataFrame]:
+    """Summary over seeds, Pareto set, epsilon frontier and plot from per-run ``results`` (re-runnable on a
+    finished sweep with ``mecosim sweep --analyze-only``)."""
+    out = Path(out_dir)
     summary = summarize(results)
     summary.to_csv(out / "summary.csv", index=False)
     frames = {"results": results, "summary": summary}
+    cfg_objectives = dict(objectives)
     if not summary.empty:
-        front = pareto_front(summary, cfg.objectives)  # type: ignore[arg-type]
+        front = pareto_front(summary, cfg_objectives)  # type: ignore[arg-type]
         front.to_csv(out / "pareto.csv", index=False)
         frames["pareto"] = front
         eps = (
@@ -199,15 +214,12 @@ def run_sweep(
             eps.to_csv(out / "epsilon.csv", index=False)
             frames["epsilon"] = eps
         if plot:
-            plot_pareto(summary, front, cfg.objectives, out / "pareto.png")
-    (out / "sweep.json").write_text(
-        json.dumps({"objectives": cfg.objectives, "seeds": cfg.seeds, "n_runs": len(all_jobs)}, indent=2),
-        encoding="utf-8",
-    )
+            plot_pareto(summary, front, cfg_objectives, out / "pareto.png")
     return frames
 
 
-# Reference categorical palette (dataviz skill, light mode): slots 1-3 plus neutral gray for baselines.
+# Reference categorical palette (dataviz skill, light mode): slots 1-3 for the delivery families, neutral gray for
+# baselines; marker shape is a second encoding so identity never relies on colour alone.
 _COLORS = {"greedy_deficit": "#2a78d6", "opportunistic_mid_journey": "#eb6834", "optimized": "#1baf7a"}
 _NEUTRAL = "#8a8985"
 _MARKERS = {
@@ -216,7 +228,14 @@ _MARKERS = {
     "greedy_deficit": "o",
     "opportunistic_mid_journey": "^",
     "optimized": "D",
+    "optimized_weighted": "D",
+    "optimized_epsilon": "P",
 }
+
+
+def _short(row: pd.Series) -> str:
+    vals = [f"{row[c]:g}" for c in row.index if c.startswith("param.") and pd.notna(row[c])]
+    return ",".join(vals)
 
 
 def plot_pareto(summary: pd.DataFrame, front: pd.DataFrame, objectives: Mapping[str, str], path: str | Path) -> None:
@@ -233,47 +252,58 @@ def plot_pareto(summary: pd.DataFrame, front: pd.DataFrame, objectives: Mapping[
     ys = traffic or obj[1:2]
     if not ys:
         return
-    fig, axes = plt.subplots(1, len(ys), figsize=(5.2 * len(ys), 4.2), squeeze=False)
+    ncols = min(2, len(ys))
+    nrows = (len(ys) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.6 * ncols, 4.0 * nrows + 0.9), squeeze=False)
+    flat_axes = list(axes.ravel())
+    for ax in flat_axes[len(ys) :]:
+        ax.set_visible(False)
     on_front = set(front["config"]) if "config" in front else set()
-    for ax, y in zip(axes[0], ys):
-        for policy, grp in summary.groupby("policy", sort=False):
-            color = _COLORS.get(str(policy), _NEUTRAL)
-            marker = _MARKERS.get(str(policy), "o")
-            ax.scatter(
-                grp[x],
-                grp[y],
-                s=46,
-                marker=marker,
-                color=color,
-                label=str(policy),
-                zorder=3,
-                edgecolors="white",
-                linewidths=1.0,
-            )
+    better = {"min": "lower is better", "max": "higher is better"}
+    for ax, y in zip(flat_axes, ys):
+        for label, grp in summary.groupby("label", sort=False):
+            policy = str(grp["policy"].iloc[0])
+            color = _COLORS.get(policy, _NEUTRAL)
+            marker = _MARKERS.get(str(label), _MARKERS.get(policy, "o"))
+            ring = {} if marker in ("x", "+", "P") else {"edgecolors": "white", "linewidths": 1.0}
+            ax.scatter(grp[x], grp[y], s=48, marker=marker, color=color, label=str(label), zorder=3, **ring)
         pf = summary[summary["config"].isin(on_front)]
         ax.scatter(
             pf[x],
             pf[y],
-            s=150,
+            s=160,
             facecolors="none",
             edgecolors="#0b0b0b",
             linewidths=1.2,
             zorder=4,
             label="Pareto set (all objectives)",
         )
-        ax.set_xlabel(f"{x} ({objectives[x]})", color="#52514e")
-        ax.set_ylabel(f"{y} ({objectives[y]})", color="#52514e")
+        texts: dict[tuple[float, float], list[str]] = {}
+        for _, row in pf.iterrows():
+            text = _short(row)
+            if text:
+                texts.setdefault((round(float(row[x]), 6), round(float(row[y]), 6)), []).append(text)
+        for (px, py), parts in texts.items():
+            ax.annotate(
+                " / ".join(parts), (px, py), textcoords="offset points", xytext=(7, 5), fontsize=7, color="#52514e"
+            )
+        ax.set_xlabel(f"{x} ({better[objectives[x]]})", color="#52514e", fontsize=9)
+        ax.set_ylabel(f"{y} ({better[objectives[y]]})", color="#52514e", fontsize=9)
         ax.grid(True, color="#e6e5e1", linewidth=0.8)
         ax.set_axisbelow(True)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
         for side in ("left", "bottom"):
             ax.spines[side].set_color("#b9b8b2")
-        ax.tick_params(colors="#52514e")
-    handles, labels = axes[0][0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=min(6, len(labels)), frameon=False)
-    fig.suptitle("Energy objective versus traffic objectives (mean over seeds)", color="#0b0b0b")
-    fig.tight_layout(rect=(0, 0.1, 1, 0.95))
+        ax.tick_params(colors="#52514e", labelsize=8)
+    handles, labels = flat_axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=min(4, len(labels)), frameon=False, fontsize=8)
+    fig.suptitle(
+        "Energy objective versus traffic objectives (mean over seeds; labels: policy parameters of the Pareto set)",
+        color="#0b0b0b",
+        fontsize=10,
+    )
+    fig.tight_layout(rect=(0, 0.07, 1, 0.96))
     fig.savefig(path, dpi=150)
     plt.close(fig)
 
