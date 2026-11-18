@@ -38,6 +38,7 @@ import pandas as pd
 import yaml
 
 from mecosim.metrics.pareto import DEFAULT_OBJECTIVES, pareto_front
+from mecosim.paths import absolute
 from mecosim.scenarios.spec import ScenarioSpec
 
 __all__ = ["SweepConfig", "expand_runs", "run_sweep", "summarize", "plot_pareto"]
@@ -166,7 +167,7 @@ def run_sweep(
     plot: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """Run all combinations (in parallel processes when ``jobs > 1``) and write CSVs, Pareto set and plot."""
-    out = Path(out_dir).resolve()
+    out = absolute(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     base = cfg.scenario.model_dump(mode="python")
     all_jobs = expand_runs(cfg)

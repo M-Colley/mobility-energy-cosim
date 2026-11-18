@@ -13,7 +13,6 @@ One mosaik step is one master step (``master_step_s / time_resolution`` mosaik t
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import mosaik_api_v3
@@ -21,6 +20,7 @@ import numpy as np
 
 from mecosim.core.orchestrator import Orchestrator
 from mecosim.energy.reference import ReferenceEnergyModel
+from mecosim.paths import absolute
 
 __all__ = ["META", "MecosimSim"]
 
@@ -66,7 +66,7 @@ class MecosimSim(mosaik_api_v3.Simulator):
         from mecosim.scenarios.spec import ScenarioSpec
 
         scen = model_params["scenario"]
-        out = Path(model_params.get("out_dir", "output/mosaik")).resolve()
+        out = absolute(model_params.get("out_dir", "output/mosaik"))
         if isinstance(scen, BuiltScenario):
             built = scen
         else:

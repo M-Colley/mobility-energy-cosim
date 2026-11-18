@@ -23,6 +23,7 @@ from mecosim.core.protocols import EnergyDriver, Policy
 from mecosim.energy.reference import ChargerSpec, EVSpec, ReferenceEnergyModel, synthetic_zone_profile
 from mecosim.metrics.mobility import mobility_metrics
 from mecosim.metrics.pareto import welfare
+from mecosim.paths import absolute
 from mecosim.policies import make_policy
 from mecosim.scenarios.build import BuiltScenario, build_scenario
 from mecosim.scenarios.spec import ScenarioSpec
@@ -158,7 +159,7 @@ def run_scenario(
     write: bool = True,
 ) -> RunResult:
     """Build (if needed) and run one scenario with one policy; write metrics, sessions and events to ``out_dir``."""
-    out = Path(out_dir).resolve()
+    out = absolute(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     built = scenario if isinstance(scenario, BuiltScenario) else build_scenario(scenario, out / "scenario")
     if isinstance(policy, str):

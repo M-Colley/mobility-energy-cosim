@@ -23,6 +23,7 @@ from gymnasium import spaces
 from mecosim.core.entities import SessionStatus
 from mecosim.core.orchestrator import Orchestrator
 from mecosim.core.protocols import Command, EnergyStop, FleetObservation
+from mecosim.paths import absolute
 from mecosim.policies.base import BasePolicy
 from mecosim.scenarios.build import BuiltScenario, build_scenario
 from mecosim.scenarios.spec import ScenarioSpec
@@ -99,7 +100,7 @@ class MecosimEnv(gym.Env):
         sumo_backend: str = "libsumo",
     ) -> None:
         super().__init__()
-        self.out_dir = Path(out_dir).resolve()
+        self.out_dir = absolute(out_dir)
         self.built = (
             scenario if isinstance(scenario, BuiltScenario) else build_scenario(scenario, self.out_dir / "scenario")
         )

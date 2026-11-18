@@ -10,6 +10,7 @@ from xml.sax.saxutils import quoteattr
 
 from mecosim.adapters.sumo.connection import sumo_binary, sumo_tool
 from mecosim.core.entities import Hub, VehicleSpec, Zone
+from mecosim.paths import absolute
 from mecosim.scenarios.spec import ScenarioSpec
 
 __all__ = ["BuiltScenario", "build_scenario", "PLUG_LENGTH_M"]
@@ -63,7 +64,7 @@ def _generate_network(spec: ScenarioSpec, out: Path) -> Path:
     if net.kind == "file":
         if net.net_file is None:
             raise ValueError("network.kind=file needs network.net_file")
-        return Path(net.net_file).resolve()
+        return absolute(net.net_file)
     path = out / "net.net.xml"
     _run(
         [
@@ -115,7 +116,7 @@ def _assign_zones(spec: ScenarioSpec, net_file: Path) -> tuple[dict[str, str], d
 
 def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
     """Generate the network, stations, fleet, ride requests and background traffic for ``spec`` in ``out_dir``."""
-    out = Path(out_dir).resolve()
+    out = absolute(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     sim = spec.simulation
     net_file = _generate_network(spec, out)

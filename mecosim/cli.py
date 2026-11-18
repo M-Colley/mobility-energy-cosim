@@ -11,6 +11,7 @@ from pathlib import Path
 import yaml
 
 from mecosim import __version__
+from mecosim.paths import absolute
 
 __all__ = ["main"]
 
@@ -81,7 +82,7 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
         print(summary[cols].to_string(index=False))
     if "pareto" in frames:
         print(f"\nPareto set: {len(frames['pareto'])} of {len(summary)} configurations")
-    print(f"outputs: {Path(args.out).resolve()}")
+    print(f"outputs: {absolute(args.out)}")
     return 0
 
 
