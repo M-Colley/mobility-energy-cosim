@@ -10,9 +10,9 @@ analysis, so that planning choices can be judged "for the greater good" rather t
 ## Why
 
 An automated fleet could move solar energy from PV-rich to PV-poor parts of a city. Whether that helps depends on
-things single-domain models leave out: an automated stop has 77 s without energy flow (robotic coupling 24 s,
-communication start-up 27 s, set-point delay 4 s, decoupling 22 s), small deliveries pay that overhead proportionally
-more, passengers on board are delayed, curbside stops block lanes, and each vehicle must keep enough energy to finish
+things single-domain models leave out: an automated stop has about 73 s without energy flow (robotic coupling 24 s,
+communication start-up 27 s, decoupling 22 s, plus a 4 s set-point delay where it does not overlap with the start-up),
+small deliveries pay that overhead proportionally more, passengers on board are delayed, curbside stops block lanes, and each vehicle must keep enough energy to finish
 its trip. mecosim makes those trade-offs explicit and measurable:
 
 - a **session model** with cited phase timings, closed-form energy over any interval and the exact inverse ("how long
@@ -60,7 +60,7 @@ Details: [docs/architecture.md](docs/architecture.md), [docs/models.md](docs/mod
 ```bash
 python -m venv .venv && . .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install eclipse-sumo
-pip install "citylearn @ git+https://github.com/M-Colley/CityLearn@feat/external-mobility-provider"
+pip install "citylearn @ git+https://github.com/M-Colley/CityLearn@feat/charger-session-dynamics"
 pip install -e ".[dev]"                                 # or ".[rl,analysis]"
 mecosim info
 
@@ -75,8 +75,9 @@ python examples/two_zone_demo/run_demo.py --reference
 python examples/two_zone_demo/make_table.py examples/two_zone_demo/output
 ```
 
-CityLearn needs the external-mobility hook (branch `feat/external-mobility-provider`) until it is released. On Windows,
-CityLearn's dataset cache can be redirected with `WIN_PD_OVERRIDE_LOCAL_APPDATA`.
+CityLearn needs the external-mobility hook and, for realistic stop timing, the charger session dynamics (branch
+`feat/charger-session-dynamics`, which contains the hook) until they are released. On Windows, CityLearn's dataset
+cache can be redirected with `WIN_PD_OVERRIDE_LOCAL_APPDATA`.
 
 Python API:
 
@@ -91,13 +92,66 @@ print(result.metrics["grid_import_kwh"], result.metrics["passenger_delay_per_tri
 
 ## Demo results
 
-Run of `python examples/two_zone_demo/run_demo.py --jobs 4` (CityLearn backend, 18 November 2026; regenerate the
-table with `make_table.py`). Scenario: 6 × 6 grid with 250 m blocks, 8 automated taxis (60 kWh, 11 kW bidirectional,
-initial SOC 0.6), 40 ride requests per hour, 900 background vehicles per hour, 3 hours (11:00–14:00 of 6 August in
-CityLearn's `citylearn_challenge_2022_phase_all_plus_evs` data, resampled to 60 s). West zone: Buildings 1–5 with four
-times their PV; east zone: Buildings 6–13 without PV. One off-street depot (4 plugs) in the west, one off-street and one
-curbside hub (2 plugs each) in the east. Each zone is netted as an energy community; zones are not netted with each
-other (fully netted, the district would import nothing because the west exports more than the east consumes).
+Run of `python examples/two_zone_demo/run_demo.py --jobs 4` (CityLearn with charger session dynamics, branch
+`feat/charger-session-dynamics` 8f2f1c1c; 18 November 2026; table via `make_table.py`). Stop timing is applied by
+CityLearn's session dynamics with mecosim's cited parameters (`timing_owner: auto` resolves to `energy_model`):
+51 s start-up, 4 s set-point delay, 3.35/3.31 kW/s ramps, 22 s stop delay; mecosim plans stop durations with the same
+semantics (1 kWh at 11 kW: 400 s, 5 kWh: 1709 s).
+
+Scenario: 6 × 6 grid with 250 m blocks, 8 automated taxis (60 kWh, 11 kW bidirectional, initial SOC 0.6), 40 ride
+requests per hour, 900 background vehicles per hour, 3 hours (11:00–14:00 of 6 August in CityLearn's
+`citylearn_challenge_2022_phase_all_plus_evs` data, resampled to 60 s). West zone: Buildings 1–5 with four times their
+PV; east zone: Buildings 6–13 without PV. One off-street depot (4 plugs) in the west, one off-street and one curbside
+hub (2 plugs each) in the east. Each zone is netted as an energy community; zones are not netted with each other
+(fully netted, the district would import nothing because the west exports more than the east consumes).
+
+| Policy | Grid import (kWh) | Emissions (kg CO2) | Deficit served (kWh) | Delivered (kWh) | Charged (kWh) | Trips/h | Wait (s) | Energy-stop delay per trip (s) | Background time loss (s) | Delivery vkm | Pareto |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| greedy_deficit (delivery_kwh=1) | 28.1 ± 1.3 | 4.86 ± 0.22 | 16.7 ± 1.3 | 16.7 ± 1.3 | 58.5 ± 1.7 | 38.8 ± 0.2 | 148 ± 3 | 0 ± 0 | 13.8 ± 0.0 | 79.1 ± 6.6 |  |
+| greedy_deficit (delivery_kwh=2) | 22.8 ± 0.0 | 3.95 ± 0.00 | 22.0 ± 0.0 | 22.0 ± 0.0 | 61.3 ± 0.1 | 38.8 ± 0.2 | 149 ± 8 | 0 ± 0 | 13.8 ± 0.1 | 71.3 ± 2.9 |  |
+| greedy_deficit (delivery_kwh=5) | 18.6 ± 0.6 | 3.22 ± 0.10 | 26.2 ± 0.6 | 26.2 ± 0.6 | 60.3 ± 1.3 | 38.6 ± 0.2 | 153 ± 2 | 0 ± 0 | 13.9 ± 0.2 | 63.0 ± 6.3 |  |
+| no_delivery | 44.8 ± 0.0 | 7.75 ± 0.00 | 0.0 ± 0.0 | 0.0 ± 0.0 | 0.0 ± 0.0 | 38.9 ± 0.2 | 108 ± 4 | 0 ± 0 | 13.7 ± 0.2 | 0.0 ± 0.0 | yes |
+| opportunistic_mid_journey (delivery_kwh=1) | 24.8 ± 0.7 | 4.29 ± 0.13 | 20.0 ± 0.7 | 20.8 ± 1.1 | 54.9 ± 9.6 | 38.6 ± 0.2 | 167 ± 15 | 74 ± 3 | 15.7 ± 0.9 | 71.4 ± 9.3 |  |
+| opportunistic_mid_journey (delivery_kwh=2) | 21.7 ± 2.8 | 3.75 ± 0.49 | 23.1 ± 2.8 | 24.8 ± 4.4 | 57.5 ± 6.4 | 38.4 ± 0.2 | 169 ± 3 | 60 ± 2 | 15.8 ± 0.2 | 66.0 ± 7.6 |  |
+| opportunistic_mid_journey (delivery_kwh=5) | 20.0 ± 0.7 | 3.46 ± 0.11 | 24.8 ± 0.7 | 25.5 ± 0.4 | 59.7 ± 3.0 | 38.6 ± 0.2 | 154 ± 7 | 44 ± 4 | 14.9 ± 0.6 | 67.4 ± 10.4 |  |
+| optimized_epsilon (epsilon_delay_s_per_h=0) | 17.3 ± 1.4 | 2.99 ± 0.25 | 27.5 ± 1.4 | 27.5 ± 1.4 | 62.5 ± 1.4 | 38.8 ± 0.2 | 159 ± 7 | 0 ± 0 | 13.8 ± 0.1 | 59.5 ± 5.6 | yes |
+| optimized_epsilon (epsilon_delay_s_per_h=1800) | 21.1 ± 1.4 | 3.65 ± 0.25 | 23.7 ± 1.4 | 23.7 ± 1.4 | 59.9 ± 0.9 | 38.6 ± 0.2 | 149 ± 10 | 38 ± 1 | 13.8 ± 0.1 | 70.4 ± 5.6 | yes |
+| optimized_epsilon (epsilon_delay_s_per_h=300) | 17.6 ± 0.8 | 3.06 ± 0.14 | 27.1 ± 0.8 | 27.1 ± 0.8 | 61.1 ± 0.7 | 38.8 ± 0.2 | 154 ± 3 | 6 ± 1 | 13.9 ± 0.2 | 57.4 ± 3.4 | yes |
+| optimized_weighted (value_of_time_per_h=0) | 20.9 ± 0.2 | 3.62 ± 0.04 | 23.9 ± 0.2 | 23.9 ± 0.2 | 59.2 ± 4.2 | 38.4 ± 0.4 | 161 ± 6 | 75 ± 3 | 13.8 ± 0.2 | 67.3 ± 8.2 |  |
+| optimized_weighted (value_of_time_per_h=15) | 17.3 ± 1.4 | 2.99 ± 0.25 | 27.5 ± 1.4 | 27.5 ± 1.4 | 62.5 ± 1.4 | 38.8 ± 0.2 | 159 ± 7 | 0 ± 0 | 13.8 ± 0.1 | 59.5 ± 5.6 | yes |
+| random | 18.5 ± 2.1 | 3.20 ± 0.36 | 26.3 ± 2.1 | 35.9 ± 6.9 | 14.5 ± 3.6 | 38.9 ± 0.2 | 117 ± 5 | 0 ± 0 | 13.8 ± 0.1 | 23.5 ± 1.6 | yes |
+
+Mean ± standard deviation over 3 seeds.
+
+"Pareto" marks the non-dominated configurations for grid import, emissions, mean wait, energy-stop delay per trip,
+background time loss (minimised) and throughput (maximised). Delivered and charged energies are CityLearn's AC
+energies at the hub chargers.
+
+![Pareto plot of the demo sweep](docs/img/two_zone_demo_pareto.png)
+
+What the numbers say for this scenario (not a general result):
+
+- Carrying PV energy to the PV-poor zone cut its grid import from 44.8 to 17.3 kWh (−61 %) with the MILP policy at
+  nearly equal throughput (38.8 versus 38.9 trips per hour) and no passenger delay from energy stops, but passengers
+  waited 51 s longer on average (159 versus 108 s) because vehicles were withdrawn from service while delivering.
+- Delivery size matters: fixed 1 kWh deliveries left 28.1 kWh of import, fixed 5 kWh deliveries 18.6 kWh. With 73 s
+  without energy flow per stop (start-up and decoupling), small deliveries spend a large share of each stop on
+  overhead.
+- Mid-journey stops with passengers cost 44–74 s of delay per completed trip and, with the curbside hub, 1.2–2.1 s more
+  time loss for background traffic, while importing more than idle-vehicle deliveries. With a value of time of 15 per
+  hour the MILP chose no mid-journey stops; ε budgets of 300 and 1800 s of passenger delay per hour led to 6 and 38 s
+  per trip with higher import (17.6 and 21.1 kWh): short mid-journey stops occupy plugs and the zone power cap that
+  longer idle-vehicle deliveries would have used.
+- The random baseline is on the Pareto set because it withdraws few vehicles at a time (lowest wait among delivering
+  policies, 117 s), but it discharged 35.9 kWh while charging only 14.5 kWh: it draws down the fleet's batteries,
+  which no objective here penalises (see limitations).
+
+<details>
+<summary>Earlier run, labelled: timing applied by mecosim (CityLearn without session dynamics)</summary>
+
+Same scenario and sweep, run with branch `feat/external-mobility-provider` only (no charger session dynamics); mecosim
+shaped the energy per interval with its own session model (anticipated stop, first set-point delayed: 1 kWh at 11 kW
+took 408 s). Mean ± standard deviation over 3 seeds; Pareto set recomputed for the six objectives above.
 
 | Policy | Grid import (kWh) | Emissions (kg CO2) | Deficit served (kWh) | Delivered (kWh) | Charged (kWh) | Trips/h | Wait (s) | Energy-stop delay per trip (s) | Background time loss (s) | Delivery vkm | Pareto |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -117,27 +171,9 @@ other (fully netted, the district would import nothing because the west exports 
 
 Mean ± standard deviation over 3 seeds.
 
-Mean ± standard deviation over 3 seeds; "Pareto" marks the non-dominated configurations for grid import, emissions,
-mean wait, energy-stop delay per trip, background time loss (minimised) and throughput (maximised). Delivered and
-charged energies are CityLearn's AC energies at the hub chargers.
+![Pareto plot, mecosim-owned timing](docs/img/two_zone_demo_pareto_mecosim_timing.png)
 
-![Pareto plot of the demo sweep](docs/img/two_zone_demo_pareto.png)
-
-What the numbers say for this scenario (not a general result):
-
-- Carrying PV energy to the PV-poor zone cut its grid import from 44.8 to 16.6 kWh (−63 %) with the MILP policy at
-  equal throughput (38.8 versus 38.9 trips per hour) and no passenger delay from energy stops, but passengers waited
-  49 s longer on average (157 versus 108 s) because vehicles were withdrawn from service while delivering.
-- Delivery size matters: fixed 1 kWh deliveries left 28.2 kWh of import, fixed 5 kWh deliveries 17.1 kWh. With
-  77 s of zero-power time per stop, small deliveries spend a large share of each stop on overhead.
-- Mid-journey stops with passengers cost 51–77 s of delay per completed trip and, with the curbside hub, about 2 s
-  more time loss for background traffic, while importing more than idle-vehicle deliveries. With a value of time of
-  15 per hour the MILP chose no mid-journey stops; ε budgets of 300 and 1800 s of passenger delay per hour led to 5 and
-  37 s per trip with higher import (17.7 and 21.3 kWh), because short mid-journey stops occupy plugs and the zone power
-  cap that longer idle-vehicle deliveries would have used.
-- The random baseline is on the Pareto set because it withdraws few vehicles at a time (lowest wait among delivering
-  policies), but it discharged 35.1 kWh while charging only 14.4 kWh: it draws down the fleet's batteries, which no
-  objective here penalises (see limitations).
+</details>
 
 ## Policies
 
@@ -171,7 +207,8 @@ that mimics the bridge; CARLA itself was not run.
 ## Limitations
 
 - **CARLA not run**: the integration follows CARLA's bridge source and is tested with a stub client only.
-- **CityLearn hook unreleased**: requires the `feat/external-mobility-provider` branch; CI installs it from git.
+- **CityLearn features unreleased**: requires the `feat/charger-session-dynamics` branch (external-mobility hook plus
+  session dynamics); CI installs it from git.
 - **Data resolution**: CityLearn datasets are hourly; mecosim holds intensive values and splits energies within each
   hour (hourly totals preserved, no intra-hour variability). Zones are energy communities without internal grid
   constraints. Zone-deficit forecasts handed to policies use a nominal COP of 3 for thermal demand.
@@ -182,8 +219,13 @@ that mimics the bridge; CARLA itself was not run.
   profile with `chargeDelay` (no ramps).
 - **Assumed values**: the wireless and pantograph coupling presets, the consumption prior (0.20 kWh/km), the reserve
   margin and factor, and all objective and welfare weights are assumptions; sweep them.
-- **Delivery accuracy**: with CityLearn's efficiency curves the measured AC energy of a delivery matches the requested
-  energy within 1 % (tests); the residual comes from evaluating the curve at per-interval average power.
+- **Timing**: by default CityLearn's charger session dynamics apply the stop timing (start delay, set-point delay,
+  ramps, stop delay) with mecosim's cited parameters, and mecosim plans stop durations with the same semantics.
+  CityLearn stores whole-step departure countdowns, so its dynamics learn the stop instant only in the departure step:
+  deliveries stay exact (measured within −0.13 % to +0.10 % of the planned energy, discharge floor), but a 1 kWh
+  charge received 14.5 Wh (60 s steps) to 38.9 Wh (15 s steps) more than planned. A fractional countdown in CityLearn
+  would remove this (requested; see docs/models.md). Without session dynamics (`timing_owner: mecosim`) the measured
+  energy of a delivery is within 1 % of the request.
 - **No terminal-SOC valuation**: the objectives do not value the fleet's energy at the end of the horizon, so policies
   that discharge without recharging (e.g. `random` in the demo) look better than they are; compare charged and
   delivered energy, or extend the horizon.

@@ -7,7 +7,7 @@ Thanks for helping. mecosim is research software; correctness and traceability m
 ```bash
 python -m venv .venv && . .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install eclipse-sumo
-pip install "citylearn @ git+https://github.com/M-Colley/CityLearn@feat/external-mobility-provider"  # optional
+pip install "citylearn @ git+https://github.com/M-Colley/CityLearn@feat/charger-session-dynamics"  # optional
 pip install -e ".[dev]"
 pytest -q
 ruff check . && ruff format --check .

@@ -77,6 +77,55 @@ The linear model never underestimates the stop time, so MILP plans never violate
 the linearisation. It assumes constant `P` during the hold; SOC-dependent power limits of the energy model (CityLearn's
 `capacity_power_curve`) are not part of it.
 
+### Who applies the timing: mecosim or the energy model
+
+`energy.timing_owner` selects where phases 2-6 are applied (`auto`, the default, picks `energy_model` when CityLearn has
+charger session dynamics, branch `feat/charger-session-dynamics`, and `mecosim` otherwise):
+
+- **`energy_model`**: CityLearn's external chargers get the session timings 1:1 (`charger_dynamics_attributes`):
+
+  | mecosim (`SessionParameters`) | CityLearn charger attribute |
+  |---|---|
+  | `coupling_s + startup_s` (24 + 27 s) | `start_delay_seconds` (51 s) |
+  | `setpoint_delay_s` (4 s) | `setpoint_delay_seconds` |
+  | `ramp_up_kw_per_s`, `ramp_down_kw_per_s` (3.35, 3.31 kW/s) | `ramp_up_kw_per_second`, `ramp_down_kw_per_second` |
+  | `decoupling_s` (22 s) | `stop_delay_seconds` |
+
+  mecosim sends a constant set-point (± the session power) and, per step, the plug-in offset
+  (`connected_since_seconds = -(arrival - step start)` when the session starts), the end offset
+  (`connected_seconds = min(step, departure - step start)`) and the departure countdown. Stop durations are planned with
+  the same parameters in CityLearn's semantics (`SessionParameters.energy_model_semantics()`): each step's command is
+  applied 4 s after the step starts, which overlaps with the 51 s start-up, so the first set-point adds no delay; at
+  `departure - stop_delay_seconds` the set-point becomes 0 and the power ramps down *after* that instant. With these
+  semantics the stop duration is `51 + 22 + E/P + P/2 (1/r_up - 1/r_down)` for `E ≥ E_tri` (1 kWh at 11 kW:
+  400.3 s instead of 407.6 s with mecosim's anticipated stop), and the MILP's linear stop time
+  (`O = fixed + max(P/2 (1/r_up - 1/r_down), P r_up⁻² / (2 (1/r_up + 1/r_down)))`) overestimates the exact time by at
+  most 0.82 s at 11 kW and never underestimates it.
+- **`mecosim`**: the chargers have no dynamics; mecosim integrates its own profile per interval and sends the interval
+  energy as an average power over the connected seconds (sections 2-3).
+
+Consistency, measured in this repository:
+
+- `tests/test_session_vs_citylearn_dynamics.py` steps CityLearn's integrator (`citylearn.internal.charger_dynamics.
+  integrate_step`) with the same timings and a session starting mid-step: for 0.4, 1, 2.5 and 5 kWh at 11 kW, 60 s and
+  15 s steps and three arrival offsets, every interval's energy equals mecosim's plan within 1e-9 kWh **when CityLearn
+  knows the exact departure**.
+- CityLearn stores whole-step departure countdowns (countdown 1 = leaves at the end of the step); the exact departure is
+  known only in the departure step, through `connected_seconds`. When the stop instant (departure − 22 s) falls in an
+  earlier step (always with 15 s steps; with 60 s steps when the departure lies in the first 22 s of a step, 37 % of
+  arrival offsets), CityLearn keeps
+  the set-point until the departure step and ramps down from its start. Over 60 arrival offsets this adds on average
+  12 Wh (60 s steps) and 23 Wh (15 s steps), at most 62 Wh and 46 Wh, to the integrator's energy; the bound is full
+  power between the true stop instant and the start of the departure step plus one ramp-down.
+- End to end (orchestrator, scripted mobility, CityLearn, `tests/test_citylearn_session_dynamics.py`): deliveries stay
+  exact because the session's discharge floor stops the battery at the planned energy: measured AC energy within
+  −0.13 % to +0.10 % of E for all eight cases, and no energy after the planned end of the transfer (residual below
+  0.1 Wh). Charging has no such cap: a 1 kWh charge received 14.5 Wh (60 s steps) and 38.9 Wh (15 s steps) more than
+  planned.
+- Requested CityLearn change: accept and store a fractional departure countdown (or a departure time in seconds), so
+  that the session dynamics stop exactly; mecosim already passes the exact value
+  (`CityLearnBackend.allow_fractional_departure`).
+
 ## 3. Trip reserve and exact delivery
 
 Mid-journey discharge must leave a trip reserve (`mecosim.core.reserve`):

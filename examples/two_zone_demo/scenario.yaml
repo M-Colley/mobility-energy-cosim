@@ -47,6 +47,7 @@ demand:
   background_period_s: 4     # 900 background vehicles per hour
 energy:
   backend: citylearn
+  timing_owner: auto         # CityLearn's charger session dynamics apply the stop timing when available
   carbon_kg_per_kwh: 0.25    # reference backend only
   price_per_kwh: 0.30        # reference backend only
   citylearn:

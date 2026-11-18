@@ -58,7 +58,10 @@ The energy step is the master step (60 s in the demo). CityLearn calls the orche
       with the step's time;
    4. **write**: for every hub plug, `connect` (with `connected_seconds`, arrival SOC for a new session,
       `departure_steps`, `discharge_soc_floor`), `incoming` or `away`; `set_vehicle_soc` for all other fleet vehicles.
-3. The driver turns the orchestrator's per-charger energy targets into CityLearn actions for the next `env.step`.
+3. The driver turns the orchestrator's per-charger targets into CityLearn actions for the next `env.step`: with
+   `timing_owner="energy_model"` (default when CityLearn has charger session dynamics) a constant set-point that
+   CityLearn shapes with start delay, set-point delay, ramps and stop delay; with `timing_owner="mecosim"` the
+   interval energy of mecosim's session profile as an average power over the connected seconds.
 
 Mobility therefore leads energy by one interval: arrivals and departures inside an interval are known before its
 energy is computed, and energy is integrated exactly over the connected part of the interval.
