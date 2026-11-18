@@ -114,6 +114,7 @@ class OpportunisticMidJourney(GreedyDeficitDispatch):
         cmds: list[Command] = []
         poor = [z for z in (self.zones_with_role("pv_poor") or list(self.context.zones)) if z in obs.zones]
         remaining = {z: self._remaining_deficit(obs, z) for z in poor}
+        slots = {z: self._concurrency_left(obs, z) for z in poor}
         routing = self.context.routing
         for v in obs.vehicles.values():
             if v.id in busy or not v.persons or v.session_id is not None or not v.destination_edge:
@@ -123,7 +124,7 @@ class OpportunisticMidJourney(GreedyDeficitDispatch):
             direct = routing.route(v.edge_id, v.destination_edge)[0]
             best = None
             for hub in self.hubs_in(poor):
-                if free.get(hub.id, 0) <= 0 or remaining.get(hub.zone, 0.0) <= 0.05:
+                if free.get(hub.id, 0) <= 0 or remaining.get(hub.zone, 0.0) <= 0.05 or slots.get(hub.zone, 0) <= 0:
                     continue
                 detour = routing.route(v.edge_id, hub.edge_id)[0] + routing.route(hub.edge_id, v.destination_edge)[0]
                 detour -= direct
@@ -143,6 +144,7 @@ class OpportunisticMidJourney(GreedyDeficitDispatch):
             busy.add(v.id)
             free[hub.id] -= 1
             remaining[hub.zone] -= energy
+            slots[hub.zone] -= 1
         if self.idle_delivery:
             cmds += super().energy_decisions(obs, busy, free)
         return cmds

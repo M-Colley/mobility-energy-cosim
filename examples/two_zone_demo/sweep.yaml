@@ -1,7 +1,7 @@
 # Policy x parameter sweep for the two-zone demo: fixed delivery sizes, optimised sizes (weighted sum) and an
 # epsilon-constraint frontier (minimise energy objectives subject to a passenger-delay budget).
 scenario: scenario.yaml
-seeds: [1, 2]
+seeds: [1, 2, 3]
 runs:
   - policy: no_delivery
   - policy: greedy_deficit
