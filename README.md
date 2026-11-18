@@ -92,11 +92,14 @@ print(result.metrics["grid_import_kwh"], result.metrics["passenger_delay_per_tri
 
 ## Demo results
 
-Run of `python examples/two_zone_demo/run_demo.py --jobs 4` (CityLearn with charger session dynamics, branch
-`feat/charger-session-dynamics` 8f2f1c1c; 18 November 2026; table via `make_table.py`). Stop timing is applied by
-CityLearn's session dynamics with mecosim's cited parameters (`timing_owner: auto` resolves to `energy_model`):
-51 s start-up, 4 s set-point delay, 3.35/3.31 kW/s ramps, 22 s stop delay; mecosim plans stop durations with the same
-semantics (1 kWh at 11 kW: 400 s, 5 kWh: 1709 s).
+Reproduce with one command: `python examples/two_zone_demo/run_demo.py --jobs 4` (39 runs: 13 configurations × 3
+seeds; then `python examples/two_zone_demo/make_table.py examples/two_zone_demo/output`). Run on 18 November 2026 with
+CityLearn branch `feat/charger-session-dynamics` 9ea5706a. CityLearn's charger session dynamics apply the stop timing
+with mecosim's cited parameters (`timing_owner: auto` resolves to `energy_model`): 51 s start-up, 4 s set-point delay,
+3.35/3.31 kW/s ramps, 22 s stop delay, exact departure via `departure_seconds`. mecosim plans stop durations with the
+same semantics (1 kWh at 11 kW: 400 s, 5 kWh: 1709 s). PV-surplus top-ups are scheduled only from 0.67 kWh at 11 kW
+(at most 25 % of the stop without energy flow); in this sweep no top-up below that size was scheduled (the only
+smaller charges come from the random baseline).
 
 Scenario: 6 × 6 grid with 250 m blocks, 8 automated taxis (60 kWh, 11 kW bidirectional, initial SOC 0.6), 40 ride
 requests per hour, 900 background vehicles per hour, 3 hours (11:00–14:00 of 6 August in CityLearn's
@@ -107,18 +110,18 @@ hub (2 plugs each) in the east. Each zone is netted as an energy community; zone
 
 | Policy | Grid import (kWh) | Emissions (kg CO2) | Deficit served (kWh) | Delivered (kWh) | Charged (kWh) | Trips/h | Wait (s) | Energy-stop delay per trip (s) | Background time loss (s) | Delivery vkm | Pareto |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| greedy_deficit (delivery_kwh=1) | 28.1 ± 1.3 | 4.86 ± 0.22 | 16.7 ± 1.3 | 16.7 ± 1.3 | 58.5 ± 1.7 | 38.8 ± 0.2 | 148 ± 3 | 0 ± 0 | 13.8 ± 0.0 | 79.1 ± 6.6 |  |
-| greedy_deficit (delivery_kwh=2) | 22.8 ± 0.0 | 3.95 ± 0.00 | 22.0 ± 0.0 | 22.0 ± 0.0 | 61.3 ± 0.1 | 38.8 ± 0.2 | 149 ± 8 | 0 ± 0 | 13.8 ± 0.1 | 71.3 ± 2.9 |  |
-| greedy_deficit (delivery_kwh=5) | 18.6 ± 0.6 | 3.22 ± 0.10 | 26.2 ± 0.6 | 26.2 ± 0.6 | 60.3 ± 1.3 | 38.6 ± 0.2 | 153 ± 2 | 0 ± 0 | 13.9 ± 0.2 | 63.0 ± 6.3 |  |
+| greedy_deficit (delivery_kwh=1) | 27.8 ± 3.6 | 4.81 ± 0.63 | 17.0 ± 3.6 | 17.0 ± 3.6 | 53.5 ± 4.8 | 38.8 ± 0.2 | 143 ± 6 | 0 ± 0 | 13.8 ± 0.2 | 59.4 ± 4.2 | yes |
+| greedy_deficit (delivery_kwh=2) | 20.7 ± 1.8 | 3.59 ± 0.32 | 24.0 ± 1.8 | 24.0 ± 1.8 | 61.8 ± 0.7 | 38.7 ± 0.0 | 139 ± 7 | 0 ± 0 | 13.8 ± 0.2 | 52.6 ± 2.0 |  |
+| greedy_deficit (delivery_kwh=5) | 16.7 ± 0.7 | 2.88 ± 0.12 | 28.1 ± 0.7 | 28.1 ± 0.7 | 58.6 ± 1.3 | 38.8 ± 0.2 | 146 ± 1 | 0 ± 0 | 13.8 ± 0.1 | 42.7 ± 2.8 | yes |
 | no_delivery | 44.8 ± 0.0 | 7.75 ± 0.00 | 0.0 ± 0.0 | 0.0 ± 0.0 | 0.0 ± 0.0 | 38.9 ± 0.2 | 108 ± 4 | 0 ± 0 | 13.7 ± 0.2 | 0.0 ± 0.0 | yes |
-| opportunistic_mid_journey (delivery_kwh=1) | 24.8 ± 0.7 | 4.29 ± 0.13 | 20.0 ± 0.7 | 20.8 ± 1.1 | 54.9 ± 9.6 | 38.6 ± 0.2 | 167 ± 15 | 74 ± 3 | 15.7 ± 0.9 | 71.4 ± 9.3 |  |
-| opportunistic_mid_journey (delivery_kwh=2) | 21.7 ± 2.8 | 3.75 ± 0.49 | 23.1 ± 2.8 | 24.8 ± 4.4 | 57.5 ± 6.4 | 38.4 ± 0.2 | 169 ± 3 | 60 ± 2 | 15.8 ± 0.2 | 66.0 ± 7.6 |  |
-| opportunistic_mid_journey (delivery_kwh=5) | 20.0 ± 0.7 | 3.46 ± 0.11 | 24.8 ± 0.7 | 25.5 ± 0.4 | 59.7 ± 3.0 | 38.6 ± 0.2 | 154 ± 7 | 44 ± 4 | 14.9 ± 0.6 | 67.4 ± 10.4 |  |
-| optimized_epsilon (epsilon_delay_s_per_h=0) | 17.3 ± 1.4 | 2.99 ± 0.25 | 27.5 ± 1.4 | 27.5 ± 1.4 | 62.5 ± 1.4 | 38.8 ± 0.2 | 159 ± 7 | 0 ± 0 | 13.8 ± 0.1 | 59.5 ± 5.6 | yes |
-| optimized_epsilon (epsilon_delay_s_per_h=1800) | 21.1 ± 1.4 | 3.65 ± 0.25 | 23.7 ± 1.4 | 23.7 ± 1.4 | 59.9 ± 0.9 | 38.6 ± 0.2 | 149 ± 10 | 38 ± 1 | 13.8 ± 0.1 | 70.4 ± 5.6 | yes |
-| optimized_epsilon (epsilon_delay_s_per_h=300) | 17.6 ± 0.8 | 3.06 ± 0.14 | 27.1 ± 0.8 | 27.1 ± 0.8 | 61.1 ± 0.7 | 38.8 ± 0.2 | 154 ± 3 | 6 ± 1 | 13.9 ± 0.2 | 57.4 ± 3.4 | yes |
-| optimized_weighted (value_of_time_per_h=0) | 20.9 ± 0.2 | 3.62 ± 0.04 | 23.9 ± 0.2 | 23.9 ± 0.2 | 59.2 ± 4.2 | 38.4 ± 0.4 | 161 ± 6 | 75 ± 3 | 13.8 ± 0.2 | 67.3 ± 8.2 |  |
-| optimized_weighted (value_of_time_per_h=15) | 17.3 ± 1.4 | 2.99 ± 0.25 | 27.5 ± 1.4 | 27.5 ± 1.4 | 62.5 ± 1.4 | 38.8 ± 0.2 | 159 ± 7 | 0 ± 0 | 13.8 ± 0.1 | 59.5 ± 5.6 | yes |
+| opportunistic_mid_journey (delivery_kwh=1) | 24.5 ± 0.7 | 4.25 ± 0.13 | 20.3 ± 0.7 | 21.4 ± 0.8 | 40.3 ± 5.8 | 38.0 ± 0.3 | 202 ± 41 | 72 ± 9 | 15.8 ± 2.5 | 46.1 ± 3.8 |  |
+| opportunistic_mid_journey (delivery_kwh=2) | 19.9 ± 0.3 | 3.45 ± 0.06 | 24.9 ± 0.3 | 27.1 ± 1.0 | 61.8 ± 0.8 | 38.4 ± 0.2 | 149 ± 2 | 50 ± 9 | 15.6 ± 0.8 | 57.7 ± 6.5 |  |
+| opportunistic_mid_journey (delivery_kwh=5) | 16.0 ± 1.1 | 2.77 ± 0.19 | 28.8 ± 1.1 | 29.8 ± 1.9 | 60.9 ± 2.1 | 38.4 ± 0.2 | 152 ± 11 | 18 ± 10 | 14.0 ± 0.2 | 44.2 ± 5.0 | yes |
+| optimized_epsilon (epsilon_delay_s_per_h=0) | 16.5 ± 0.4 | 2.85 ± 0.08 | 28.3 ± 0.4 | 28.3 ± 0.4 | 58.5 ± 1.1 | 38.8 ± 0.2 | 146 ± 9 | 0 ± 0 | 13.8 ± 0.1 | 42.1 ± 2.9 | yes |
+| optimized_epsilon (epsilon_delay_s_per_h=1800) | 21.1 ± 2.8 | 3.65 ± 0.50 | 23.7 ± 2.8 | 23.7 ± 2.8 | 53.3 ± 6.1 | 38.6 ± 0.2 | 149 ± 14 | 44 ± 2 | 13.8 ± 0.2 | 46.2 ± 4.7 |  |
+| optimized_epsilon (epsilon_delay_s_per_h=300) | 16.9 ± 0.6 | 2.93 ± 0.11 | 27.9 ± 0.6 | 27.9 ± 0.6 | 57.3 ± 1.0 | 38.7 ± 0.0 | 143 ± 7 | 7 ± 1 | 13.8 ± 0.2 | 41.9 ± 1.8 | yes |
+| optimized_weighted (value_of_time_per_h=0) | 20.9 ± 0.1 | 3.62 ± 0.02 | 23.9 ± 0.1 | 23.9 ± 0.1 | 49.9 ± 12.5 | 38.2 ± 0.2 | 163 ± 19 | 73 ± 0 | 13.9 ± 0.2 | 45.2 ± 9.9 |  |
+| optimized_weighted (value_of_time_per_h=15) | 16.5 ± 0.4 | 2.85 ± 0.08 | 28.3 ± 0.4 | 28.3 ± 0.4 | 58.5 ± 1.1 | 38.8 ± 0.2 | 146 ± 9 | 0 ± 0 | 13.8 ± 0.1 | 42.1 ± 2.9 | yes |
 | random | 18.5 ± 2.1 | 3.20 ± 0.36 | 26.3 ± 2.1 | 35.9 ± 6.9 | 14.5 ± 3.6 | 38.9 ± 0.2 | 117 ± 5 | 0 ± 0 | 13.8 ± 0.1 | 23.5 ± 1.6 | yes |
 
 Mean ± standard deviation over 3 seeds.
@@ -131,27 +134,28 @@ energies at the hub chargers.
 
 What the numbers say for this scenario (not a general result):
 
-- Carrying PV energy to the PV-poor zone cut its grid import from 44.8 to 17.3 kWh (−61 %) with the MILP policy at
+- Carrying PV energy to the PV-poor zone cut its grid import from 44.8 to 16.5 kWh (−63 %) with the MILP policy at
   nearly equal throughput (38.8 versus 38.9 trips per hour) and no passenger delay from energy stops, but passengers
-  waited 51 s longer on average (159 versus 108 s) because vehicles were withdrawn from service while delivering.
-- Delivery size matters: fixed 1 kWh deliveries left 28.1 kWh of import, fixed 5 kWh deliveries 18.6 kWh. With 73 s
+  waited 38 s longer on average (146 versus 108 s) because vehicles were withdrawn from service while delivering.
+- Delivery size matters: fixed 1 kWh deliveries left 27.8 kWh of import, fixed 5 kWh deliveries 16.7 kWh. With 73 s
   without energy flow per stop (start-up and decoupling), small deliveries spend a large share of each stop on
   overhead.
-- Mid-journey stops with passengers cost 44–74 s of delay per completed trip and, with the curbside hub, 1.2–2.1 s more
-  time loss for background traffic, while importing more than idle-vehicle deliveries. With a value of time of 15 per
-  hour the MILP chose no mid-journey stops; ε budgets of 300 and 1800 s of passenger delay per hour led to 6 and 38 s
-  per trip with higher import (17.6 and 21.1 kWh): short mid-journey stops occupy plugs and the zone power cap that
-  longer idle-vehicle deliveries would have used.
-- The random baseline is on the Pareto set because it withdraws few vehicles at a time (lowest wait among delivering
-  policies, 117 s), but it discharged 35.9 kWh while charging only 14.5 kWh: it draws down the fleet's batteries,
-  which no objective here penalises (see limitations).
+- Mid-journey stops with passengers cost 18–72 s of delay per completed trip and 0.3–2.1 s more time loss for
+  background traffic (curbside hub). Large mid-journey deliveries (5 kWh) gave the lowest import (16.0 kWh) at 18 s
+  of delay per trip; small ones (1 kWh) delayed passengers most for the least energy. With a value of time of 15 per
+  hour the MILP chose no mid-journey stops; ε budgets of 300 and 1800 s of passenger delay per hour led to 7 and 44 s
+  per trip and imports of 16.9 and 21.1 kWh: the extra mid-journey stops occupy plugs and the zone power cap that
+  idle-vehicle deliveries would have used.
+- The random baseline is on the Pareto set because it withdraws few vehicles at a time (117 s mean wait), but it
+  discharged 35.9 kWh while charging only 14.5 kWh: it draws down the fleet's batteries, which no objective here
+  penalises (see limitations).
 
 <details>
 <summary>Earlier run, labelled: timing applied by mecosim (CityLearn without session dynamics)</summary>
 
-Same scenario and sweep, run with branch `feat/external-mobility-provider` only (no charger session dynamics); mecosim
-shaped the energy per interval with its own session model (anticipated stop, first set-point delayed: 1 kWh at 11 kW
-took 408 s). Mean ± standard deviation over 3 seeds; Pareto set recomputed for the six objectives above.
+Same scenario and sweep, run with branch `feat/external-mobility-provider` only (no charger session dynamics) and
+before the minimum top-up rule; mecosim shaped the energy per interval with its own session model (anticipated stop,
+first set-point delayed: 1 kWh at 11 kW took 408 s). Mean ± standard deviation over 3 seeds; Pareto set recomputed for the six objectives above.
 
 | Policy | Grid import (kWh) | Emissions (kg CO2) | Deficit served (kWh) | Delivered (kWh) | Charged (kWh) | Trips/h | Wait (s) | Energy-stop delay per trip (s) | Background time loss (s) | Delivery vkm | Pareto |
 |---|---|---|---|---|---|---|---|---|---|---|---|
