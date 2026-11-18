@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Simulation outputs (keep generated data out of git)
+runs/
+output/
+outputs/
+examples/**/output/
+*.sumo.log
+tripinfo*.xml
+statistics*.xml
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
