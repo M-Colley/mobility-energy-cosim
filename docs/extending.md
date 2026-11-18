@@ -40,6 +40,7 @@ differ only in the energy decisions. Register it for the CLI and sweeps:
 
 ```python
 from mecosim.policies import POLICIES
+
 POLICIES["price_threshold"] = DeliverWhenPriceHigh
 ```
 

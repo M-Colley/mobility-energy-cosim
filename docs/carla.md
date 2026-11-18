@@ -78,15 +78,24 @@ explicitly with `hubs[].edge`.
    from mecosim.scenarios import ScenarioSpec, build_scenario
    from mecosim.policies import make_policy
 
-   spec = ScenarioSpec.from_yaml("scenario_town04.yaml")      # mobility_step_s: 0.05, network.kind: file
+   spec = ScenarioSpec.from_yaml("scenario_town04.yaml")  # mobility_step_s: 0.05, network.kind: file
    built = build_scenario(spec, "output/carla/scenario")
    port = 8813
-   bridge = launch_bridge(CarlaBridgeConfig(carla_root="/opt/carla", sumo_port=port, tls_manager="sumo"),
-                          built.sumocfg)                       # retries until SUMO accepts the connection
-   orch = make_orchestrator(built, make_policy("optimized"), output_dir="output/carla/sumo",
-                            sumo_backend="traci", num_clients=2, client_order=2, port=port)
+   bridge = launch_bridge(
+       CarlaBridgeConfig(carla_root="/opt/carla", sumo_port=port, tls_manager="sumo"), built.sumocfg
+   )  # retries until SUMO accepts the connection
+   orch = make_orchestrator(
+       built,
+       make_policy("optimized"),
+       output_dir="output/carla/sumo",
+       sumo_backend="traci",
+       num_clients=2,
+       client_order=2,
+       port=port,
+   )
    orch.run(make_energy_driver(built))
-   orch.close(); bridge.wait()
+   orch.close()
+   bridge.wait()
    ```
 
    `bridge_command(cfg, sumocfg)` returns the equivalent command line:
