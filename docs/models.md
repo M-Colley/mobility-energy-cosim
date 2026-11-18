@@ -196,7 +196,7 @@ Verified with SUMO 1.28.0 (`eclipse-sumo` wheel) in `tests/test_sumo_integration
    hubs (the stop blocks the lane; traffic impact shows in background travel times).
 
 A SUMO branch (`taxi-energy-stops`, refs eclipse-sumo/sumo#15586) is planned to keep such stops natively. mecosim
-detects it with the vehicle parameter `device.taxi.keepEnergyStops` and uses it only when
+detects it with the vehicle parameter `device.taxi.keepChargingStops` and uses it only when
 `use_native_taxi_energy_stops=True`; the workaround stays the default for released SUMO.
 
 ## 7. What is not modelled

@@ -92,6 +92,7 @@ def make_orchestrator(
     gui: bool = False,
     sumo_extra: list[str] | None = None,
     sumo_binary: str | None = None,
+    orchestrator_options: dict[str, Any] | None = None,
 ) -> Orchestrator:
     spec = built.spec
     sim = spec.simulation
@@ -119,6 +120,7 @@ def make_orchestrator(
         timing_owner=spec.energy.timing_owner,
         max_passenger_delay_s=spec.demand.max_passenger_delay_s,
         energy_transfer=spec.energy.transfer,
+        **dict(orchestrator_options or {}),
     )
     return Orchestrator(fed, policy, built.hubs, built.zones, built.fleet, cfg, seed=spec.seed)
 

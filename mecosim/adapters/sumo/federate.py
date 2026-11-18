@@ -449,11 +449,11 @@ class SumoFederate:
 
     def taxi_keeps_energy_stops(self, vehicle_id: str) -> bool:
         """Native taxi-device energy stops (SUMO branch ``taxi-energy-stops``, refs #15586), detected by the
-        ``device.taxi.keepEnergyStops`` parameter; ``False`` for released SUMO."""
+        ``device.taxi.keepChargingStops`` parameter; ``False`` for released SUMO."""
         if not self.in_simulation(vehicle_id):
             return False
         try:
-            value = self.api.vehicle.getParameter(vehicle_id, "device.taxi.keepEnergyStops")
+            value = self.api.vehicle.getParameter(vehicle_id, "device.taxi.keepChargingStops")
         except self._exc:
             return False
         return str(value).lower() in ("1", "true")
