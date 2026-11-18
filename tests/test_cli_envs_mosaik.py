@@ -58,7 +58,7 @@ def test_cli_run_and_sweep(tmp_path: Path) -> None:
     out = tmp_path / "sweep_out"
     assert main(["sweep", str(tmp_path / "sweep.yaml"), "--out", str(out), "--jobs", "2"]) == 0
     res = pd.read_csv(out / "results.csv")
-    assert len(res) == 5 and (res["error"].astype(str).replace("nan", "") == "").all()
+    assert len(res) == 5 and (res["error"].isna() | (res["error"].astype("string") == "")).all()
     assert len(pd.read_csv(out / "pareto.csv")) >= 1
     assert len(pd.read_csv(out / "epsilon.csv")) == 2
     assert (out / "pareto.png").stat().st_size > 10_000
