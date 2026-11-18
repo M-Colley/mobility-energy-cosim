@@ -15,8 +15,22 @@ network:
   lanes: 1
   speed_mps: 13.89
 zones:
-  - {id: west, role: pv_rich, x_range: [0.0, 0.5], pv_scale: 4.0, pv_kwp: 30, load_kw_mean: 15}
-  - {id: east, role: pv_poor, x_range: [0.5, 1.0], pv_scale: 0.0, pv_kwp: 0, load_kw_mean: 20}
+  # CityLearn buildings: west = Building_1-5 with 4x their PV; east = Building_6-13 without PV.
+  # pv_kwp / load_kw_mean are only used by the reference energy model (synthetic profiles).
+  - id: west
+    role: pv_rich
+    x_range: [0.0, 0.5]
+    pv_scale: 4.0
+    pv_kwp: 30
+    load_kw_mean: 8
+    buildings: [Building_1, Building_2, Building_3, Building_4, Building_5]
+  - id: east
+    role: pv_poor
+    x_range: [0.5, 1.0]
+    pv_scale: 0.0
+    pv_kwp: 0
+    load_kw_mean: 12
+    buildings: [Building_6, Building_7, Building_8, Building_9, Building_10, Building_11, Building_12, Building_13]
 hubs:
   - {id: depot_west, zone: west, plugs: 4, power_kw: 11.0}
   - {id: hub_east_a, zone: east, plugs: 2, power_kw: 11.0}
@@ -27,7 +41,7 @@ fleet:
   max_power_kw: 11
   initial_soc: 0.6
 demand:
-  ride_period_s: 60          # one ride request per minute
+  ride_period_s: 90          # 40 ride requests per hour
   ride_min_distance_m: 600
   max_passenger_delay_s: 600
   background_period_s: 4     # 900 background vehicles per hour
@@ -38,7 +52,6 @@ energy:
   citylearn:
     dataset: citylearn_challenge_2022_phase_all_plus_evs
     start_time_step: 131     # dataset hour index: day 5, 11:00
-    buildings_per_zone: 5
 session:
   preset: robotic_conductive
 reserve:
