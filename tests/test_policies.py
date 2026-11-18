@@ -219,3 +219,34 @@ def test_epsilon_constraint_limits_passenger_delay() -> None:
 def test_milp_linear_overhead_matches_session_model() -> None:
     model = SessionModel()
     assert model.linear_overhead_s(11.0) == pytest.approx(24 + 27 + 4 + 22 + 5.5 * (1 / 3.35 + 1 / 3.31))
+
+
+# ------------------------------------------------------------------------------------------------ minimum top-up
+def test_min_surplus_chunk_from_session_model() -> None:
+    from mecosim.core.session import SessionParameters
+
+    m = SessionModel(SessionParameters().energy_model_semantics())
+    assert m.energy_for_overhead_share(0.25, 11.0) == pytest.approx(0.669, abs=1e-3)
+    assert m.params.fixed_overhead_s / m.stop_duration_s(m.energy_for_overhead_share(0.25, 11.0), 11.0) == (
+        pytest.approx(0.25)
+    )
+    assert SessionModel().energy_for_overhead_share(0.25, 11.0) == pytest.approx(0.696, abs=1e-3)
+
+
+def test_surplus_top_up_needs_minimum_energy_unless_forced() -> None:
+    ctx = context()
+    p = NoDelivery(charge_on_surplus=True, surplus_target_soc=0.6, recharge_below_soc=0.3, recharge_target_soc=0.295)
+    p.reset(ctx)
+    min_kwh = ctx.session_model.energy_for_overhead_share(0.25, 11.0)
+    small = vstate("av0", "1,0", soc=0.595)  # 0.32 kWh to the target: overhead would dominate
+    assert (0.6 - 0.595) * 60 / 0.95 < min_kwh
+    assert p.decide(obs([small], surplus_kw=20.0)) == []
+    big = vstate("av0", "1,0", soc=0.55)  # 3.2 kWh: worth a stop
+    (cmd,) = p.decide(obs([big], surplus_kw=20.0))
+    assert cmd.direction == "charge" and cmd.energy_kwh >= min_kwh
+    forced = vstate("av0", "1,0", soc=0.29)  # below the low-SOC threshold: charged even though the energy is small
+    (cmd,) = p.decide(obs([forced], surplus_kw=20.0))
+    assert cmd.energy_kwh < min_kwh
+    explicit = NoDelivery(charge_on_surplus=True, surplus_target_soc=0.6, surplus_min_chunk_kwh=0.1)
+    explicit.reset(ctx)
+    assert len(explicit.decide(obs([small], surplus_kw=20.0))) == 1

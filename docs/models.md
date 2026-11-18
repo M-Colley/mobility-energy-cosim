@@ -122,9 +122,10 @@ Consistency, measured in this repository:
   −0.13 % to +0.10 % of E for all eight cases, and no energy after the planned end of the transfer (residual below
   0.1 Wh). Charging has no such cap: a 1 kWh charge received 14.5 Wh (60 s steps) and 38.9 Wh (15 s steps) more than
   planned.
-- Requested CityLearn change: accept and store a fractional departure countdown (or a departure time in seconds), so
-  that the session dynamics stop exactly; mecosim already passes the exact value
-  (`CityLearnBackend.allow_fractional_departure`).
+- CityLearn is adding `connect(..., departure_seconds=...)`, the exact departure for the session dynamics. mecosim
+  already passes it (seconds from the start of the step); `CityLearnBackend.exact_departure` decides whether it is
+  forwarded: `False` (current default), `None` (when the installed CityLearn's `env.mobility.connect` accepts the
+  keyword, a capability check, not a version check) or `True`. A test that needs it is skipped until CityLearn has it.
 
 ## 3. Trip reserve and exact delivery
 
@@ -219,6 +220,27 @@ intensities come from the energy model (CityLearn dataset). The sweep (`mecosim 
 Pareto sets instead of a single "best" policy. Only the decisions for the current slot are executed (rolling horizon).
 
 Heuristic policies use the same zone power cap (`GreedyDeficitDispatch`, `OpportunisticMidJourney`).
+
+### Minimum PV-surplus top-up
+
+Every stop has a fixed time without energy flow (73 s with CityLearn-owned timing, 77 s with mecosim-owned timing), so
+small charges spend most of the stop on overhead: 0.14, 0.20 and 0.34 kWh at 11 kW spend 61 %, 53 % and 40 % of the
+stop without energy. Policies therefore schedule PV-surplus top-ups only above a minimum energy, the smallest energy
+whose stop spends at most `surplus_max_overhead_share` of its duration without energy flow
+(`SessionModel.energy_for_overhead_share`):
+
+| Overhead share at most | 7.4 kW | 11 kW | 22 kW |
+|---|---|---|---|
+| 50 % | 0.15 kWh | 0.22 kWh | 0.45 kWh |
+| 33 % | 0.30 kWh | 0.45 kWh | 0.89 kWh |
+| **25 % (default)** | **0.45 kWh** | **0.67 kWh** | **1.34 kWh** |
+| 20 % | 0.60 kWh | 0.89 kWh | 1.79 kWh |
+| 10 % | 1.35 kWh | 2.01 kWh | 4.02 kWh |
+
+(CityLearn-owned timing; with mecosim-owned timing the 25 % threshold is 0.70 kWh at 11 kW.) The default 25 % keeps the
+transfer at least three times as long as the overhead; it is a policy parameter, not a measured value
+(`surplus_min_chunk_kwh` sets an explicit minimum instead). Recharging below `recharge_below_soc`, which protects the
+trip reserve, is never held back.
 
 ## 6. Mobility side: SUMO taxi device and energy stops (stock SUMO)
 

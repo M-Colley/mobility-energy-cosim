@@ -437,6 +437,17 @@ class SessionModel:
             return max(0.5 * power_kw * (ku - kd), power_kw * ku**2 / (2.0 * k))
         return 0.5 * power_kw * k
 
+    def energy_for_overhead_share(self, max_share: float, power_kw: float) -> float:
+        """Smallest energy whose stop spends at most ``max_share`` of its duration without energy flow.
+
+        The zero-power time of a stop is :attr:`SessionParameters.fixed_overhead_s`; the stop lasts
+        :meth:`stop_duration_s`, so the share falls as the energy grows. Returns
+        ``deliverable_energy_kwh(fixed_overhead / max_share, P)``.
+        """
+        if not 0 < max_share <= 1:
+            raise ValueError("max_share must be in (0, 1]")
+        return self.deliverable_energy_kwh(self.params.fixed_overhead_s / max_share, power_kw)
+
     def linear_overhead_s(self, power_kw: float) -> float:
         """Overhead ``O`` of the linear stop-time model ``T(E) ~= O + E / P`` used by the MILP policy.
 

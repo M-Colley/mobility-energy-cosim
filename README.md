@@ -186,7 +186,8 @@ Mean ± standard deviation over 3 seeds.
 | `random` | sanity baseline |
 
 All policies share the same passenger dispatch (nearest idle vehicle) and recharge rule, so they differ only in their
-energy decisions. Gymnasium (`mecosim.envs.MecosimEnv`) and PettingZoo (`MecosimParallelEnv`) environments expose the
+energy decisions. PV-surplus top-ups are scheduled only when at most 25 % of the stop passes without energy flow
+(0.67 kWh at 11 kW; see docs/models.md); low-SOC recharging is never held back. Gymnasium (`mecosim.envs.MecosimEnv`) and PettingZoo (`MecosimParallelEnv`) environments expose the
 hub choice and the energy per stop (continuous, kWh) as actions; `mecosim.mosaik.MecosimSim` is a mosaik simulator.
 
 ## Mid-journey stops in SUMO

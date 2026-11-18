@@ -27,6 +27,12 @@ class BasePolicy:
         charge_on_surplus: Idle vehicles below ``surplus_target_soc`` also charge in zones with PV surplus.
         surplus_target_soc: Target SOC when charging on PV surplus.
         surplus_chunk_kwh: Maximum energy of one PV-surplus charging stop (keeps vehicles available for service).
+        surplus_max_overhead_share: PV-surplus top-ups are only scheduled if at most this share of the stop passes
+            without energy flow (coupling, start-up, decoupling). Default 0.25, i.e. the transfer takes at least three
+            quarters of the stop; with the cited timings that is 0.67 kWh at 11 kW (CityLearn-owned timing) or
+            0.70 kWh (mecosim-owned timing), computed with :meth:`SessionModel.energy_for_overhead_share`.
+        surplus_min_chunk_kwh: Explicit minimum energy of a PV-surplus top-up; overrides the share when given.
+            Low-SOC recharging (``recharge_below_soc``, forced by the reserve) is never held back.
     """
 
     name = "base"
@@ -40,6 +46,8 @@ class BasePolicy:
         charge_on_surplus: bool = False,
         surplus_target_soc: float = 0.6,
         surplus_chunk_kwh: float = 5.0,
+        surplus_max_overhead_share: float = 0.25,
+        surplus_min_chunk_kwh: float | None = None,
     ) -> None:
         self.min_service_soc = min_service_soc
         self.recharge_below_soc = recharge_below_soc
@@ -47,6 +55,8 @@ class BasePolicy:
         self.charge_on_surplus = charge_on_surplus
         self.surplus_target_soc = surplus_target_soc
         self.surplus_chunk_kwh = surplus_chunk_kwh
+        self.surplus_max_overhead_share = surplus_max_overhead_share
+        self.surplus_min_chunk_kwh = surplus_min_chunk_kwh
         self.ctx: PolicyContext | None = None
         self.rng = np.random.default_rng(0)
 
@@ -114,6 +124,13 @@ class BasePolicy:
             busy.add(best.id)
         return cmds
 
+    def surplus_min_energy_kwh(self, vehicle_id: str, hub: Hub) -> float:
+        """Minimum energy of a PV-surplus top-up for this vehicle at this hub (see ``surplus_max_overhead_share``)."""
+        if self.surplus_min_chunk_kwh is not None:
+            return self.surplus_min_chunk_kwh
+        power = min(hub.power_kw, self.context.vehicles[vehicle_id].max_power_kw)
+        return self.context.session_model.energy_for_overhead_share(self.surplus_max_overhead_share, power)
+
     def recharge(self, obs: FleetObservation, busy: set[str], free: dict[str, int]) -> list[Command]:
         """Low-SOC rule (and optional PV-surplus charging) at hubs in PV-rich zones."""
         cmds: list[Command] = []
@@ -122,6 +139,7 @@ class BasePolicy:
         for v in self.available(obs, busy):
             target = None
             chunk = math.inf
+            surplus = False
             if v.soc < self.recharge_below_soc:
                 target = self.recharge_target_soc
                 zones = rich
@@ -129,6 +147,7 @@ class BasePolicy:
                 target = self.surplus_target_soc
                 zones = sorted(surplus_zones)
                 chunk = self.surplus_chunk_kwh
+                surplus = True
             if target is None:
                 continue
             hub = self.nearest_hub(v, self.hubs_in(zones), free)
@@ -137,6 +156,8 @@ class BasePolicy:
             energy = min(chunk, max(0.0, (target - v.soc) * v.capacity_kwh / hub.charge_efficiency))
             if energy <= 0.05:
                 continue
+            if surplus and energy < self.surplus_min_energy_kwh(v.id, hub):
+                continue  # overhead would dominate this top-up
             cmds.append(EnergyStop(v.id, hub.id, energy, direction="charge"))
             busy.add(v.id)
             free[hub.id] -= 1
