@@ -1,0 +1,47 @@
+# Two-zone demo: a PV-rich west and a PV-poor east, automated electric taxis, ride requests and background traffic.
+# Energy: CityLearn (citylearn_challenge_2022_phase_all_plus_evs, hourly data resampled to 60 s steps).
+name: two_zone_demo
+seed: 1
+simulation:
+  begin_s: 0
+  duration_s: 10800          # 3 h, 11:00-14:00 of dataset day 5 (2024-08-06)
+  master_step_s: 60          # CityLearn step = master step
+  mobility_step_s: 1.0       # SUMO step (0.05 when CARLA joins)
+  start_hour: 11
+network:
+  kind: grid
+  grid_number: 6
+  grid_length_m: 250
+  lanes: 1
+  speed_mps: 13.89
+zones:
+  - {id: west, role: pv_rich, x_range: [0.0, 0.5], pv_scale: 4.0, pv_kwp: 30, load_kw_mean: 15}
+  - {id: east, role: pv_poor, x_range: [0.5, 1.0], pv_scale: 0.0, pv_kwp: 0, load_kw_mean: 20}
+hubs:
+  - {id: depot_west, zone: west, plugs: 4, power_kw: 11.0}
+  - {id: hub_east_a, zone: east, plugs: 2, power_kw: 11.0}
+  - {id: hub_east_b, zone: east, plugs: 2, power_kw: 11.0, curbside: true}
+fleet:
+  n_vehicles: 8
+  capacity_kwh: 60
+  max_power_kw: 11
+  initial_soc: 0.6
+demand:
+  ride_period_s: 60          # one ride request per minute
+  ride_min_distance_m: 600
+  max_passenger_delay_s: 600
+  background_period_s: 4     # 900 background vehicles per hour
+energy:
+  backend: citylearn
+  carbon_kg_per_kwh: 0.25    # reference backend only
+  price_per_kwh: 0.30        # reference backend only
+  citylearn:
+    dataset: citylearn_challenge_2022_phase_all_plus_evs
+    start_time_step: 131     # dataset hour index: day 5, 11:00
+    buildings_per_zone: 5
+session:
+  preset: robotic_conductive
+reserve:
+  prior_kwh_per_km: 0.2
+  uncertainty_factor: 1.2
+  safety_margin_soc: 0.05

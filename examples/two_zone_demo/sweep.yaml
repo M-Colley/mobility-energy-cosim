@@ -1,0 +1,22 @@
+# Policy x parameter sweep for the two-zone demo: fixed delivery sizes, optimised sizes (weighted sum) and an
+# epsilon-constraint frontier (minimise energy objectives subject to a passenger-delay budget).
+scenario: scenario.yaml
+seeds: [1, 2]
+runs:
+  - policy: no_delivery
+  - policy: greedy_deficit
+    grid: {delivery_kwh: [1, 2, 5]}
+  - policy: opportunistic_mid_journey
+    grid: {delivery_kwh: [1, 2, 5]}
+  - policy: optimized
+    label: optimized_weighted
+    grid: {weights.value_of_time_per_h: [0, 15]}
+  - policy: optimized
+    label: optimized_epsilon
+    grid: {epsilon_delay_s_per_h: [0, 300, 1800]}
+  - policy: random
+objectives:
+  grid_import_kwh: min
+  emissions_kg: min
+  passenger_delay_per_trip_s: min
+  throughput_trips_per_h: max
