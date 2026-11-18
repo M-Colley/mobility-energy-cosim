@@ -34,7 +34,12 @@ __all__ = ["ObjectiveWeights", "Candidate", "MilpSolution", "OptimizedDelivery"]
 
 @dataclass(frozen=True)
 class ObjectiveWeights:
-    """Explicit objective weights (currency units). Defaults are ASSUMED illustrative values; sweep them.
+    """Explicit objective weights (currency units); sweep them.
+
+    Defaults: carbon price 0.19 per kg CO2 (US EPA 2023 social cost of carbon, USD 190/t, 2 % discount rate); battery
+    wear 0.02 per kWh throughput (ASSUMED: battery 100 per kWh / (3000 cycles x 2 x 0.8 depth)); value of time 15 per
+    hour and the traffic proxy are ASSUMED; replacement cost 0 because delivered energy is recharged from PV surplus
+    that the zone KPIs value at 0 when exported.
 
     Attributes:
         energy: Multiplier on the value of the deficit served.
@@ -50,14 +55,14 @@ class ObjectiveWeights:
     """
 
     energy: float = 1.0
-    carbon_price_per_kg: float = 0.10
+    carbon_price_per_kg: float = 0.19
     unserved_penalty_per_kwh: float = 0.0
     value_of_time_per_h: float = 15.0
     passenger_delay: float = 1.0
     traffic_per_s_curbside: float = 0.002
     traffic_offstreet_factor: float = 0.05
-    wear_per_kwh: float = 0.05
-    replacement_cost_per_kwh: float = 0.08
+    wear_per_kwh: float = 0.02
+    replacement_cost_per_kwh: float = 0.0
     approach_energy: float = 1.0
 
 
@@ -305,6 +310,24 @@ class OptimizedDelivery(BasePolicy):
             n_fc = max(1, math.ceil(S * L / self.context.clock.master_step_s - 1e-9))
             cap = max(0.0, sum(zs.deficit_forecast_kwh[:n_fc]) - planned)
             rows.append(({n + i: 1.0 for i in idx}, -np.inf, cap))
+            # zone power cap per slot: concurrent deliveries limited to the forecast deficit power (at least one
+            # vehicle while there is a deficit), minus deliveries already running or planned in the zone
+            busy_zone = sum(
+                1
+                for s in obs.sessions.values()
+                if s.direction == "discharge" and self.context.hubs[s.hub_id].zone == zid
+            )
+            per_slot = max(1, int(round(L / self.context.clock.master_step_s)))
+            for slot in range(S):
+                window = zs.deficit_forecast_kwh[slot * per_slot : (slot + 1) * per_slot]
+                if not window:
+                    break
+                deficit_kw = sum(window) / (len(window) * self.context.clock.master_step_s / 3600.0)
+                power = max(cd.power_kw for cd in cands if cd.hub.zone == zid)
+                allowed = (max(1, int(deficit_kw // power)) if deficit_kw > 1e-9 else 0) - busy_zone
+                occ = {i: 1.0 for i in idx if cands[i].slot <= slot < cands[i].slot + cands[i].occupancy_slots}
+                if occ:
+                    rows.append((occ, -np.inf, float(max(0, allowed))))
         # epsilon constraint on cumulative passenger delay
         if self.epsilon_delay_s_per_h is not None:
             if self._t0 is None:

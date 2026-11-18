@@ -55,9 +55,10 @@ class GreedyDeficitDispatch(BasePolicy):
         cmds: list[Command] = []
         poor = [z for z in (self.zones_with_role("pv_poor") or list(self.context.zones)) if z in obs.zones]
         remaining = {z: self._remaining_deficit(obs, z) for z in poor}
+        slots = {z: self._concurrency_left(obs, z) for z in poor}
         for zone in sorted(poor, key=lambda z: -remaining[z]):
             for v in sorted(self.available(obs, busy, self.min_soc_to_deliver), key=lambda s: -s.soc):
-                if len(cmds) >= self.max_vehicles_per_epoch or remaining[zone] <= 0.05:
+                if len(cmds) >= self.max_vehicles_per_epoch or remaining[zone] <= 0.05 or slots[zone] <= 0:
                     break
                 hub = self.nearest_hub(v, self.hubs_in([zone]), free)
                 if hub is None:
@@ -67,7 +68,20 @@ class GreedyDeficitDispatch(BasePolicy):
                 busy.add(v.id)
                 free[hub.id] -= 1
                 remaining[zone] -= energy
+                slots[zone] -= 1
         return cmds
+
+    def _concurrency_left(self, obs: FleetObservation, zone: str) -> int:
+        """Concurrent deliveries allowed in a zone: deficit power / charger power (at least one while in deficit)."""
+        zs = obs.zones[zone]
+        hubs = self.hubs_in([zone])
+        if zs.deficit_kw <= 1e-9 or not hubs:
+            return 0
+        power = max(h.power_kw for h in hubs)
+        running = sum(
+            1 for s in obs.sessions.values() if s.direction == "discharge" and self.context.hubs[s.hub_id].zone == zone
+        )
+        return max(1, int(zs.deficit_kw // power)) - running
 
 
 class OpportunisticMidJourney(GreedyDeficitDispatch):

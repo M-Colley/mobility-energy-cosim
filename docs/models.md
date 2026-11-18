@@ -150,7 +150,9 @@ energy totals are preserved exactly; within-hour variability is not represented.
 - `e ≤ e_max·y`, `e ≥ e_min·y`, with `e_max` from the reserve (`(SOC_arrival − floor_reserve) × capacity × η_d`) and
   the time budget;
 - one stop per vehicle; hub connector capacity per slot (a stop occupies the slots its maximal duration covers);
-- zone deficit cap over the horizon (minus energy already planned there);
+- zone deficit cap over the horizon (minus energy already planned there) and a zone power cap per slot (concurrent
+  deliveries ≤ forecast deficit power / charger power, at least one while there is a deficit), so that deliveries
+  offset local load instead of being exported;
 - time budget `(O + detour)·y + e·3600/P ≤ budget` (idle vehicles: `max_idle_stop_s`; vehicles with passengers: the
   passengers' maximum acceptable delay);
 - optional ε-constraint: cumulative passenger delay from energy stops ≤ ε × elapsed hours (then the delay weight is 0);
@@ -159,8 +161,15 @@ energy totals are preserved exactly; within-hour variability is not represented.
   dwell × cost per second; curbside stops count fully, off-street stops with a factor) − battery wear per kWh −
   replacement cost of the delivered energy − energy of the approach/detour.
 
-All weight defaults are **assumed** illustrative values; the sweep (`mecosim sweep`) varies them and reports Pareto
-sets instead of a single "best" policy. Only the decisions for the current slot are executed (rolling horizon).
+Weight defaults: carbon price 0.19 per kg CO2 (US EPA (2023), *Report on the Social Cost of Greenhouse Gases*, central
+estimate USD 190 per tonne for 2020 emissions at a 2 % discount rate); battery wear 0.02 per kWh of battery throughput
+(**assumed**: battery cost 100 per kWh / (3000 cycles × 2 × 0.8 depth of discharge)); value of time 15 per hour and the
+traffic proxy (0.002 per second of curbside dwell, 5 % of that off-street) are **assumed**; replacement cost 0 because
+the delivered energy is recharged from PV surplus that the zone KPIs value at 0 when exported. Prices and carbon
+intensities come from the energy model (CityLearn dataset). The sweep (`mecosim sweep`) varies the weights and reports
+Pareto sets instead of a single "best" policy. Only the decisions for the current slot are executed (rolling horizon).
+
+Heuristic policies use the same zone power cap (`GreedyDeficitDispatch`, `OpportunisticMidJourney`).
 
 ## 6. Mobility side: SUMO taxi device and energy stops (stock SUMO)
 

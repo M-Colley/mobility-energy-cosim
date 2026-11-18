@@ -23,7 +23,7 @@ DEFAULT_OBJECTIVES: dict[str, Sense] = {
 #: Explicit welfare weights (monetary units per unit of metric; ASSUMED illustrative values, all configurable).
 DEFAULT_WELFARE_WEIGHTS: dict[str, float] = {
     "energy_cost": -1.0,  # currency per currency
-    "emissions_kg": -0.1,  # carbon price per kg CO2
+    "emissions_kg": -0.19,  # carbon price per kg CO2 (US EPA 2023 social cost of carbon, USD 190/t)
     "peak_import_kw": -0.0,  # demand charge per kW (set per tariff)
     "passenger_delay_energy_stops_s": -15.0 / 3600.0,  # value of time 15 currency/h
     "throughput_trips_per_h": 0.0,

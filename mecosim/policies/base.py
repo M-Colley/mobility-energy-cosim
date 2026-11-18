@@ -38,7 +38,7 @@ class BasePolicy:
         recharge_below_soc: float = 0.3,
         recharge_target_soc: float = 0.8,
         charge_on_surplus: bool = False,
-        surplus_target_soc: float = 0.9,
+        surplus_target_soc: float = 0.6,
         surplus_chunk_kwh: float = 5.0,
     ) -> None:
         self.min_service_soc = min_service_soc
