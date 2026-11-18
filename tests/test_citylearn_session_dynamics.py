@@ -6,10 +6,11 @@ For 0.4, 1, 2.5 and 5 kWh at 11 kW, master steps of 60 s and 15 s, sessions star
 * the AC energy CityLearn delivers equals the planned E within the efficiency tolerance (1 %);
 * no energy flows after the planned end of the transfer (departure - decoupling + ramp-down), i.e. the stop ends when
   the plan says;
-* CityLearn stores whole-step departure countdowns, so the stop instant (departure - stop delay) is known only in the
-  departure step: discharges stay exact because of the discharge floor; charges get a bounded surplus. With an exact
-  departure the per-interval energies equal the plan (``tests/test_session_vs_citylearn_dynamics.py``, CityLearn's
-  integrator stepped directly).
+* with the exact departure (``connect(..., departure_seconds=...)``, the default when CityLearn has it) every interval
+  equals the plan and charges get no surplus;
+* with whole-step countdowns only (``exact_departure=False``, as for CityLearn versions without ``departure_seconds``)
+  the stop instant (departure - stop delay) is known only in the departure step: discharges stay exact because of the
+  discharge floor; charges get a bounded surplus.
 """
 
 from __future__ import annotations

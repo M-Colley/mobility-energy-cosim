@@ -221,12 +221,11 @@ that mimics the bridge; CARLA itself was not run.
 - **Assumed values**: the wireless and pantograph coupling presets, the consumption prior (0.20 kWh/km), the reserve
   margin and factor, and all objective and welfare weights are assumptions; sweep them.
 - **Timing**: by default CityLearn's charger session dynamics apply the stop timing (start delay, set-point delay,
-  ramps, stop delay) with mecosim's cited parameters, and mecosim plans stop durations with the same semantics.
-  CityLearn stores whole-step departure countdowns, so its dynamics learn the stop instant only in the departure step:
-  deliveries stay exact (measured within −0.13 % to +0.10 % of the planned energy, discharge floor), but a 1 kWh
-  charge received 14.5 Wh (60 s steps) to 38.9 Wh (15 s steps) more than planned. A fractional countdown in CityLearn
-  would remove this (requested; see docs/models.md). Without session dynamics (`timing_owner: mecosim`) the measured
-  energy of a delivery is within 1 % of the request.
+  ramps, stop delay) with mecosim's cited parameters; mecosim plans stop durations with the same semantics and passes
+  the exact departure (`departure_seconds`). Measured agreement with the plan: deliveries below 0.0001 %, charges at
+  most +0.0001 Wh. With CityLearn versions without `departure_seconds` the stop instant is known only in the departure
+  step: deliveries stay within ±0.13 % (discharge floor), charges overshoot by up to 62 Wh. Without session dynamics
+  (`timing_owner: mecosim`) the measured energy of a delivery is within 1 % of the request.
 - **No terminal-SOC valuation**: the objectives do not value the fleet's energy at the end of the horizon, so policies
   that discharge without recharging (e.g. `random` in the demo) look better than they are; compare charged and
   delivered energy, or extend the horizon.

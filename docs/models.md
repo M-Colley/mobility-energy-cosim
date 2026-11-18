@@ -110,22 +110,30 @@ Consistency, measured in this repository:
   integrate_step`) with the same timings and a session starting mid-step: for 0.4, 1, 2.5 and 5 kWh at 11 kW, 60 s and
   15 s steps and three arrival offsets, every interval's energy equals mecosim's plan within 1e-9 kWh **when CityLearn
   knows the exact departure**.
-- CityLearn stores whole-step departure countdowns (countdown 1 = leaves at the end of the step); the exact departure is
-  known only in the departure step, through `connected_seconds`. When the stop instant (departure − 22 s) falls in an
-  earlier step (always with 15 s steps; with 60 s steps when the departure lies in the first 22 s of a step, 37 % of
-  arrival offsets), CityLearn keeps
-  the set-point until the departure step and ramps down from its start. Over 60 arrival offsets this adds on average
-  12 Wh (60 s steps) and 23 Wh (15 s steps), at most 62 Wh and 46 Wh, to the integrator's energy; the bound is full
-  power between the true stop instant and the start of the departure step plus one ramp-down.
-- End to end (orchestrator, scripted mobility, CityLearn, `tests/test_citylearn_session_dynamics.py`): deliveries stay
-  exact because the session's discharge floor stops the battery at the planned energy: measured AC energy within
-  −0.13 % to +0.10 % of E for all eight cases, and no energy after the planned end of the transfer (residual below
-  0.1 Wh). Charging has no such cap: a 1 kWh charge received 14.5 Wh (60 s steps) and 38.9 Wh (15 s steps) more than
-  planned.
-- CityLearn is adding `connect(..., departure_seconds=...)`, the exact departure for the session dynamics. mecosim
-  already passes it (seconds from the start of the step); `CityLearnBackend.exact_departure` decides whether it is
-  forwarded: `False` (current default), `None` (when the installed CityLearn's `env.mobility.connect` accepts the
-  keyword, a capability check, not a version check) or `True`. A test that needs it is skipped until CityLearn has it.
+- **Exact departure** (default when CityLearn has it): mecosim passes `connect(..., departure_seconds=...)`, the planned
+  departure in seconds from the start of the step, on every step of the session; CityLearn places the stop delay
+  exactly, also when the stop instant lies in an earlier step than the departure, and derives the observed countdown
+  itself. `CityLearnBackend.exact_departure` = `None` (default: when `env.mobility.connect` accepts the keyword, a
+  capability check, not a version check), `True` or `False`. The energy session ends at the planned end of the stop;
+  SUMO releases the vehicle at its next step (up to 1 s later).
+- End to end (orchestrator, scripted mobility, CityLearn branch `feat/charger-session-dynamics` 9ea5706a,
+  `tests/test_citylearn_session_dynamics.py`, `runs/measure_charge.py`), 0.4/1/2.5/5 kWh at 11 kW, 60 s and 15 s steps,
+  sessions starting mid-step:
+
+  | | Delivery error | Charge overshoot |
+  |---|---|---|
+  | exact departure (`departure_seconds`) | below 0.0001 % in all 8 cases | at most +0.0001 Wh |
+  | whole-step countdown only | −0.13 % to +0.10 % | +0.0001 to +61.8 Wh (60 s steps: 61.8, 14.5, 0.0, 47.8 Wh; 15 s steps: 43.1, 38.9, 5.6, 26.4 Wh) |
+
+  With the exact departure every interval's energy equals the plan within 1 Wh or 1 %; no energy flows after the
+  planned end of the transfer.
+- Without the exact departure (`exact_departure=False`, or an older CityLearn) the countdown is whole steps
+  (countdown 1 = leaves at the end of the step) and the stop instant is known only in the departure step. When it lies
+  in an earlier step (always with 15 s steps; with 60 s steps when the departure lies in the first 22 s of a step, 37 %
+  of arrival offsets), CityLearn keeps the set-point until the departure step and ramps down from its start. Over 60
+  arrival offsets the integrator then delivers on average 12 Wh (60 s steps) and 23 Wh (15 s steps) more, at most
+  62 Wh and 46 Wh; the bound is full power between the true stop instant and the start of the departure step plus one
+  ramp-down. Deliveries stay exact through the discharge floor; charges overshoot as in the table.
 
 ## 3. Trip reserve and exact delivery
 
