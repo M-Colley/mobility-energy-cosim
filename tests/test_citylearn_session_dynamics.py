@@ -42,7 +42,7 @@ def dataset():
     return load_schema(DATASET)
 
 
-def run_session(tmp_path, dataset, step: float, energy: float, direction: str = "discharge"):
+def run_session(tmp_path, dataset, step: float, energy: float, direction: str = "discharge", exact_departure=False):
     schema, root = dataset
     zones = [Zone("west", "pv_rich", 2.0), Zone("east", "pv_poor", 0.0)]
     hubs = {
@@ -65,6 +65,7 @@ def run_session(tmp_path, dataset, step: float, energy: float, direction: str = 
     patched, _ = patch_schema(resampled, zones, zb, hubs, fleet, SchemaPatch(session_dynamics=params))
     patched["central_agent"] = True
     driver = CityLearnDriver(patched, zb, deficit_zones=("east",))
+    driver.backend.exact_departure = exact_departure
     hub = "he" if direction == "discharge" else "hw"
     start_edge = "4.15,0" if hub == "he" else "1.85,0"  # 0.37 km at 10 m/s: arrival 37 s after the command
     mob = FakeMobility(fleet, hubs, {"av0": start_edge})
@@ -118,3 +119,30 @@ def test_charge_surplus_with_whole_step_countdown_is_bounded(tmp_path, dataset, 
     surplus = sess.measured_terminal_kwh - 1.0
     assert -0.01 <= surplus <= bound * 1.01 + 0.01
     assert np.isfinite(surplus)
+
+
+def _supports_departure_seconds() -> bool:
+    import inspect
+
+    from citylearn.mobility import MobilityInterface
+
+    return "departure_seconds" in inspect.signature(MobilityInterface.connect).parameters
+
+
+@pytest.mark.skipif(not _supports_departure_seconds(), reason="CityLearn without connect(departure_seconds=...)")
+@pytest.mark.parametrize("step", [60.0, 15.0])
+@pytest.mark.parametrize("energy", [0.4, 1.0, 2.5, 5.0])
+def test_exact_departure_seconds_matches_the_plan(tmp_path, dataset, step: float, energy: float) -> None:
+    """With the exact departure the session dynamics stop on time: every interval equals the plan and a charge gets
+    no surplus."""
+    orch, sess, intervals, driver = run_session(tmp_path, dataset, step, energy, exact_departure=True)
+    assert driver.backend.uses_departure_seconds
+    model = check(sess, intervals, step, energy)
+    prof = model.delivery_profile(sess.energy_kwh, P, "discharge")
+    for r in intervals:
+        a = r["time_s"] - step - sess.arrival_s
+        planned = prof.energy(a, a + step)
+        assert r["terminal_kwh"] == pytest.approx(planned, abs=max(1e-3, 0.01 * abs(planned)))
+    assert -sess.measured_terminal_kwh == pytest.approx(energy, rel=0.01)
+    _, ch, _, _ = run_session(tmp_path / "charge", dataset, step, energy, direction="charge", exact_departure=True)
+    assert ch.measured_terminal_kwh == pytest.approx(energy, rel=0.01)

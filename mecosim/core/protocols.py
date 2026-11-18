@@ -259,6 +259,7 @@ class EnergyBackend(Protocol):
         connected_seconds: float | None = None,
         discharge_soc_floor: float | None = None,
         connected_since_seconds: float | None = None,
+        departure_seconds: float | None = None,
     ) -> None: ...
 
     def incoming(

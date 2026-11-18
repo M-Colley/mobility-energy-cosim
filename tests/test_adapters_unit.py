@@ -166,3 +166,45 @@ def test_carla_bridge_command() -> None:
     ):
         assert part in joined
     assert CARLA_ID_PREFIX == "carla"
+
+
+class _Mobility:
+    def __init__(self, with_seconds: bool) -> None:
+        self.calls: list[dict] = []
+        if with_seconds:
+            self.connect = self._connect_seconds  # type: ignore[method-assign]
+
+    def connect(self, charger_id, ev_id, *, departure_steps=None, connected_seconds=None):  # noqa: ANN001
+        self.calls.append({"departure_steps": departure_steps})
+
+    def _connect_seconds(
+        self,
+        charger_id,
+        ev_id,
+        *,
+        departure_steps=None,
+        connected_seconds=None,  # noqa: ANN001
+        departure_seconds=None,
+    ):
+        self.calls.append({"departure_steps": departure_steps, "departure_seconds": departure_seconds})
+
+
+@pytest.mark.parametrize("with_seconds", [False, True])
+@pytest.mark.parametrize("mode", [False, None, True])
+def test_departure_seconds_by_capability(with_seconds: bool, mode) -> None:  # noqa: ANN001
+    from mecosim.adapters.citylearn.backend import CityLearnBackend
+
+    backend = CityLearnBackend.__new__(CityLearnBackend)
+    backend.env = type("Env", (), {"mobility": _Mobility(with_seconds)})()
+    backend._supports_departure_seconds = None
+    backend.exact_departure = mode
+    assert backend.supports_departure_seconds is with_seconds
+    if mode is True and not with_seconds:
+        with pytest.raises(TypeError):
+            backend.connect("c", "ev", departure_steps=2.4, departure_seconds=84.0)
+        return
+    backend.connect("c", "ev", departure_steps=2.4, departure_seconds=84.0)
+    call = backend.env.mobility.calls[-1]
+    assert call["departure_steps"] == 3  # CityLearn countdowns are whole steps
+    passed = with_seconds and mode is not False
+    assert ("departure_seconds" in call and call["departure_seconds"] == 84.0) is passed

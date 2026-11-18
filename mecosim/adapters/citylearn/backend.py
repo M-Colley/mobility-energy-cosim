@@ -9,6 +9,7 @@ efficiency curve, power and SOC limits, the session's discharge floor) is CityLe
 
 from __future__ import annotations
 
+import inspect
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -53,9 +54,11 @@ class CityLearnBackend:
         self._zone_pv: dict[str, np.ndarray] = {}
         self._carbon: np.ndarray | None = None
         self._price: np.ndarray | None = None
-        #: Pass fractional departure countdowns (exact departure) to CityLearn. Off: CityLearn validates and stores
-        #: whole steps (checked with branch feat/charger-session-dynamics 8f2f1c1c).
-        self.allow_fractional_departure = False
+        #: Pass the exact departure (``connect(..., departure_seconds=...)``) to CityLearn's session dynamics:
+        #: ``True`` = always (fails on a CityLearn without it), ``None`` = when the installed CityLearn supports it
+        #: (detected from the signature of ``env.mobility.connect``), ``False`` = never (whole-step countdown only).
+        self.exact_departure: bool | None = False
+        self._supports_departure_seconds: bool | None = None
         self.refresh()
 
     def refresh(self) -> None:
@@ -93,13 +96,32 @@ class CityLearnBackend:
     def time_step(self) -> int:
         return int(self.env.time_step)
 
+    @property
+    def supports_departure_seconds(self) -> bool:
+        """Capability check: does ``env.mobility.connect`` accept ``departure_seconds``?"""
+        if self._supports_departure_seconds is None:
+            try:
+                params = inspect.signature(self.env.mobility.connect).parameters
+            except (TypeError, ValueError):
+                params = {}
+            self._supports_departure_seconds = "departure_seconds" in params
+        return self._supports_departure_seconds
+
+    @property
+    def uses_departure_seconds(self) -> bool:
+        if self.exact_departure is None:
+            return self.supports_departure_seconds
+        return bool(self.exact_departure)
+
     def connect(self, charger_id: str, ev_id: str, **kwargs: Any) -> None:
-        """``env.mobility.connect``. ``departure_steps`` arrives as the exact (fractional) number of steps; CityLearn
-        stores whole steps, so it is rounded up unless :attr:`allow_fractional_departure` is set for a CityLearn
-        that stores fractional countdowns. With whole steps the session dynamics learn the stop instant only in the
-        departure step (see ``docs/models.md``)."""
+        """``env.mobility.connect``. ``departure_seconds`` (exact departure from the start of the step, given by the
+        orchestrator with CityLearn-owned timing) is passed only when :attr:`uses_departure_seconds`; without it the
+        session dynamics learn the stop instant only in the departure step (see ``docs/models.md``)."""
+        dep_s = kwargs.pop("departure_seconds", None)
+        if dep_s is not None and self.uses_departure_seconds:
+            kwargs["departure_seconds"] = dep_s
         dep = kwargs.get("departure_steps")
-        if dep is not None and not self.allow_fractional_departure:
+        if dep is not None:
             kwargs["departure_steps"] = max(1, math.ceil(float(dep) - 1e-9))
         self.env.mobility.connect(charger_id, ev_id, **kwargs)
 

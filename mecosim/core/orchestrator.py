@@ -668,9 +668,11 @@ class Orchestrator:
             }
             dynamics = self.config.timing_owner == "energy_model"
             if dynamics:
-                # CityLearn session dynamics: offsets from the start of the step; exact departure in steps.
+                # CityLearn session dynamics: offsets from the start of the step; whole-step countdown plus the
+                # exact departure in seconds (used by backends that support it, dropped otherwise).
                 kwargs["connected_seconds"] = b - start
-                kwargs["departure_steps"] = max((dep - start) / self.clock.master_step_s, 1.0)
+                kwargs["departure_steps"] = max(1, math.ceil((dep - start) / self.clock.master_step_s - 1e-9))
+                kwargs["departure_seconds"] = dep - start
                 if first:
                     kwargs["connected_since_seconds"] = -(a - start)
                 setpoint = sess.sign * sess.power_kw
