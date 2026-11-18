@@ -196,7 +196,11 @@ def run_scenario(
         orch.log,
         list(orch.sessions.values()),
         out,
-        {"policy": getattr(policy, "name", type(policy).__name__), **dict(policy_params or {})},
+        {
+            "policy": getattr(policy, "name", type(policy).__name__),
+            "timing_owner": orch.config.timing_owner,
+            **dict(policy_params or {}),
+        },
     )
     if write:
         with open(out / "metrics.json", "w", encoding="utf-8") as fh:
