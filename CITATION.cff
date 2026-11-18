@@ -1,0 +1,66 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "mobility-energy-cosim (mecosim): co-simulation of automated electric vehicles that carry energy across a city"
+type: software
+authors:
+  - family-names: Colley
+    given-names: Mark
+license: MIT
+version: 0.1.0
+date-released: 2026-11-18
+repository-code: "https://github.com/M-Colley/mobility-energy-cosim"
+keywords:
+  - co-simulation
+  - vehicle-to-grid
+  - automated vehicles
+  - SUMO
+  - CityLearn
+  - Pareto analysis
+references:
+  - type: software
+    title: "Eclipse SUMO - Simulation of Urban MObility"
+    url: "https://eclipse.dev/sumo/"
+  - type: software
+    title: "CityLearn"
+    url: "https://github.com/citylearn-project/CityLearn"
+  - type: conference-paper
+    title: "Robot-Based Fast Charging of Electric Vehicles"
+    authors:
+      - family-names: Walzel
+        given-names: Bernhard
+      - family-names: Hirz
+        given-names: Mario
+      - family-names: Brunner
+        given-names: Helmut
+      - family-names: Kreutzer
+        given-names: Nikolaus
+    year: 2019
+    collection-title: "SAE Technical Paper 2019-01-0869"
+  - type: report
+    title: "Quantifying Time to Charge"
+    authors:
+      - family-names: Watt
+        given-names: Ed
+      - family-names: Bani Shamseh
+        given-names: Mohammad
+      - family-names: Gadamsetty
+        given-names: Pranav
+    institution:
+      name: "National Renewable Energy Laboratory / Idaho National Laboratory (ChargeX)"
+    year: 2025
+  - type: article
+    title: "Test and Modelling of Commercial V2G CHAdeMO Chargers to Assess the Suitability for Grid Services"
+    authors:
+      - family-names: Zecchino
+        given-names: Antonio
+      - family-names: Thingvad
+        given-names: Andreas
+      - family-names: Andersen
+        given-names: Peter Bach
+      - family-names: Marinelli
+        given-names: Mattia
+    journal: "World Electric Vehicle Journal"
+    volume: 10
+    issue: 2
+    start: 21
+    year: 2019
