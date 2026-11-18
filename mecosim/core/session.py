@@ -57,6 +57,9 @@ class SessionParameters:
             ``True`` (default) assumes the controller sends the set-point once the charger reports readiness.
         anticipate_stop: Whether the controller anticipates the end of a planned transfer, i.e. sends the ramp-down
             command early so that no set-point delay is added at the end (default ``True``).
+        ramp_down_after_stop: Stop semantics of CityLearn's charger session dynamics: the set-point becomes zero
+            ``decoupling_s`` before departure and the power ramps down *after* that instant (within the decoupling
+            time). ``False`` (default): the ramp-down ends at that instant.
         name: Preset name, for logging.
     """
 
@@ -68,6 +71,7 @@ class SessionParameters:
     decoupling_s: float = 22.0
     delay_first_setpoint: bool = True
     anticipate_stop: bool = True
+    ramp_down_after_stop: bool = False
     name: str = "robotic_conductive"
 
     def __post_init__(self) -> None:
@@ -91,6 +95,15 @@ class SessionParameters:
     def with_remote_control(self) -> SessionParameters:
         """Return a copy with the remote-control set-point delay (7 s, Zecchino et al. 2019)."""
         return replace(self, setpoint_delay_s=7.0)
+
+    def energy_model_semantics(self) -> SessionParameters:
+        """The same timings with the semantics of CityLearn's charger session dynamics (energy-model timing).
+
+        CityLearn applies each step's command ``setpoint_delay_s`` after the step starts, which overlaps with the
+        start-up of a new session (``start_delay_seconds = coupling + start-up`` is longer), so the first set-point adds
+        no delay; at ``departure - stop_delay_seconds`` the set-point becomes zero and the power ramps down afterwards.
+        """
+        return replace(self, delay_first_setpoint=False, ramp_down_after_stop=True)
 
 
 #: Coupling presets. ``robotic_conductive`` uses the cited defaults of ``docs/models.md``. The other presets contain
@@ -280,6 +293,15 @@ class SessionModel:
         """Ramp the profile down to zero so that it ends at ``transfer_end`` (or later without anticipation)."""
         prm = self.params
         down = prm.ramp_down_kw_per_s
+        if prm.ramp_down_after_stop:
+            p_end = float(prof.powers[-1])
+            ramp = min(abs(p_end) / down, prm.decoupling_s)
+            p_cut = p_end - math.copysign(down * ramp, p_end) if p_end else 0.0
+            t = np.append(prof.times, transfer_end + ramp)
+            pw = np.append(prof.powers, p_cut)
+            if p_cut != 0.0:  # disconnected while still ramping: power drops to zero
+                t, pw = np.append(t, transfer_end + ramp), np.append(pw, 0.0)
+            return PowerProfile(t, pw)
         if prm.anticipate_stop:
             # Find the latest time s such that ramping down from p(s) reaches 0 exactly at transfer_end.
             # Scan segments backwards: condition p(s) = down * (transfer_end - s) (magnitude).
@@ -316,26 +338,50 @@ class SessionModel:
         prm = self.params
         return power_kw**2 * 0.5 * (1.0 / prm.ramp_up_kw_per_s + 1.0 / prm.ramp_down_kw_per_s) / _SECONDS_PER_HOUR
 
-    def transfer_time_s(self, energy_kwh: float, power_kw: float) -> float:
-        """Exact ramp-aware transfer time (first power to zero power) to deliver ``energy_kwh`` at ``power_kw`` max."""
+    def _rates(self) -> tuple[float, float, float]:
+        prm = self.params
+        ku, kd = 1.0 / prm.ramp_up_kw_per_s, 1.0 / prm.ramp_down_kw_per_s
+        return ku, kd, ku + kd
+
+    def _check_after(self, peak_kw: float) -> None:
+        prm = self.params
+        if prm.ramp_down_after_stop and peak_kw / prm.ramp_down_kw_per_s > prm.decoupling_s + 1e-12:
+            raise ValueError("with ramp_down_after_stop the ramp-down must fit into decoupling_s")
+
+    def _window_s(self, energy_kwh: float, power_kw: float) -> float:
+        """Time from the first power to the start of the decoupling time for an exact delivery of ``energy_kwh``."""
         if energy_kwh <= 0:
             return 0.0
         if power_kw <= 0:
             raise ValueError("power_kw must be > 0")
-        prm = self.params
-        k = 1.0 / prm.ramp_up_kw_per_s + 1.0 / prm.ramp_down_kw_per_s  # s per kW
+        ku, kd, k = self._rates()
         e_ws = energy_kwh * _SECONDS_PER_HOUR  # kW*s
-        e_tri = 0.5 * power_kw**2 * k
-        if e_ws >= e_tri:
-            return power_kw * k + (e_ws - e_tri) / power_kw
-        peak = math.sqrt(2.0 * e_ws / k)
-        return peak * k
+        full = e_ws >= 0.5 * power_kw**2 * k
+        peak = power_kw if full else math.sqrt(2.0 * e_ws / k)
+        if self.params.ramp_down_after_stop:
+            self._check_after(peak)
+            # ramp up, hold until the stop instant, ramp down afterwards
+            return e_ws / power_kw + 0.5 * power_kw * (ku - kd) if full else peak * ku
+        # ramp up, hold, ramp down to zero at the stop instant
+        return power_kw * k + (e_ws - 0.5 * power_kw**2 * k) / power_kw if full else peak * k
+
+    def transfer_time_s(self, energy_kwh: float, power_kw: float) -> float:
+        """Exact ramp-aware transfer time (first power to zero power) to deliver ``energy_kwh`` at ``power_kw`` max."""
+        if energy_kwh <= 0:
+            return 0.0
+        window = self._window_s(energy_kwh, power_kw)
+        if not self.params.ramp_down_after_stop:
+            return window
+        ku, kd, k = self._rates()
+        e_ws = energy_kwh * _SECONDS_PER_HOUR
+        peak = power_kw if e_ws >= 0.5 * power_kw**2 * k else math.sqrt(2.0 * e_ws / k)
+        return window + peak * kd
 
     def stop_duration_s(self, energy_kwh: float, power_kw: float) -> float:
         """Stop duration (arrival at standstill to free to leave) to deliver ``energy_kwh``; 0 if no energy."""
         if energy_kwh <= 0:
             return 0.0
-        return self.params.fixed_overhead_s + self.transfer_time_s(energy_kwh, power_kw)
+        return self.params.fixed_overhead_s + self._window_s(energy_kwh, power_kw)
 
     def deliverable_energy_kwh(self, stop_duration_s: float, power_kw: float) -> float:
         """Maximum energy deliverable within a stop of the given duration (inverse of :meth:`stop_duration_s`)."""
@@ -343,8 +389,14 @@ class SessionModel:
         window = stop_duration_s - prm.fixed_overhead_s
         if window <= 0 or power_kw <= 0:
             return 0.0
-        k = 1.0 / prm.ramp_up_kw_per_s + 1.0 / prm.ramp_down_kw_per_s
-        if window >= power_kw * k:
+        ku, kd, k = self._rates()
+        if prm.ramp_down_after_stop:
+            if window >= power_kw * ku:
+                e_ws = power_kw * window - 0.5 * power_kw**2 * (ku - kd)
+            else:
+                peak = window / ku
+                e_ws = 0.5 * peak**2 * k
+        elif window >= power_kw * k:
             e_ws = 0.5 * power_kw**2 * k + power_kw * (window - power_kw * k)
         else:
             peak = window / k
@@ -359,33 +411,41 @@ class SessionModel:
             return PowerProfile.empty()
         prm = self.params
         sign = 1.0 if direction == "charge" else -1.0
-        k = 1.0 / prm.ramp_up_kw_per_s + 1.0 / prm.ramp_down_kw_per_s
+        ku, kd, k = self._rates()
         e_ws = energy_kwh * _SECONDS_PER_HOUR
         t0 = prm.ready_s
-        if e_ws >= 0.5 * power_kw**2 * k:
-            t_up = power_kw / prm.ramp_up_kw_per_s
-            t_down = power_kw / prm.ramp_down_kw_per_s
-            hold = (e_ws - 0.5 * power_kw**2 * k) / power_kw
+        full = e_ws >= 0.5 * power_kw**2 * k
+        peak = power_kw if full else math.sqrt(2.0 * e_ws / k)
+        t_up, t_down = peak * ku, peak * kd
+        hold = (e_ws - 0.5 * power_kw**2 * k) / power_kw if full else 0.0
+        if full:
             times = [t0, t0 + t_up, t0 + t_up + hold, t0 + t_up + hold + t_down]
             powers = [0.0, sign * power_kw, sign * power_kw, 0.0]
         else:
-            peak = math.sqrt(2.0 * e_ws / k)
-            t_up = peak / prm.ramp_up_kw_per_s
-            t_down = peak / prm.ramp_down_kw_per_s
             times = [t0, t0 + t_up, t0 + t_up + t_down]
             powers = [0.0, sign * peak, 0.0]
+        if prm.ramp_down_after_stop:
+            self._check_after(peak)
         return PowerProfile(times, powers)
 
     # ----------------------------------------------------------------------------------------------- linearisation
+    def _linear_shift_s(self, power_kw: float) -> float:
+        """``sup_E (window(E) - E/P)``: the smallest shift that makes the linear model never underestimate."""
+        ku, kd, k = self._rates()
+        if self.params.ramp_down_after_stop:
+            # full deliveries: P (ku - kd) / 2; triangles: max over the peak p of p ku - p^2 k / (2P) = P ku^2 / (2k)
+            return max(0.5 * power_kw * (ku - kd), power_kw * ku**2 / (2.0 * k))
+        return 0.5 * power_kw * k
+
     def linear_overhead_s(self, power_kw: float) -> float:
         """Overhead ``O`` of the linear stop-time model ``T(E) ~= O + E / P`` used by the MILP policy.
 
-        ``O = fixed_overhead + P/2 * (1/r_up + 1/r_down)``. The linear model is exact for
-        ``E >= triangle_energy_kwh(P)`` and overestimates the exact time by at most ``P/2 * (1/r_up + 1/r_down)``
-        seconds below that energy (see ``docs/models.md``).
+        Default semantics: ``O = fixed_overhead + P/2 (1/r_up + 1/r_down)``, exact for ``E >=
+        triangle_energy_kwh(P)``. With ``ramp_down_after_stop`` (CityLearn semantics) ``O = fixed_overhead +
+        max(P/2 (1/r_up - 1/r_down), P r_up^-2 / (2 (1/r_up + 1/r_down)))``. In both cases the linear model never
+        underestimates the exact time; :meth:`linearisation_error_bound_s` bounds the overestimate.
         """
-        prm = self.params
-        return prm.fixed_overhead_s + 0.5 * power_kw * (1.0 / prm.ramp_up_kw_per_s + 1.0 / prm.ramp_down_kw_per_s)
+        return self.params.fixed_overhead_s + self._linear_shift_s(power_kw)
 
     def linear_stop_duration_s(self, energy_kwh: float, power_kw: float) -> float:
         """Linearised stop time ``O + E/P`` (0 for ``E <= 0``)."""
@@ -394,9 +454,8 @@ class SessionModel:
         return self.linear_overhead_s(power_kw) + energy_kwh * _SECONDS_PER_HOUR / power_kw
 
     def linearisation_error_bound_s(self, power_kw: float) -> float:
-        """Upper bound of ``linear_stop_duration_s - stop_duration_s`` (the linear model never underestimates)."""
-        prm = self.params
-        return 0.5 * power_kw * (1.0 / prm.ramp_up_kw_per_s + 1.0 / prm.ramp_down_kw_per_s)
+        """Upper bound of ``linear_stop_duration_s - stop_duration_s`` (reached as ``E -> 0``)."""
+        return self._linear_shift_s(power_kw)
 
 
 def battery_energy(terminal_kwh: float, efficiency: float) -> float:
