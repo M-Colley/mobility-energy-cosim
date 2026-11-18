@@ -53,6 +53,9 @@ class CityLearnBackend:
         self._zone_pv: dict[str, np.ndarray] = {}
         self._carbon: np.ndarray | None = None
         self._price: np.ndarray | None = None
+        #: Pass fractional departure countdowns (exact departure) to CityLearn. Off: CityLearn validates and stores
+        #: whole steps (checked with branch feat/charger-session-dynamics 8f2f1c1c).
+        self.allow_fractional_departure = False
         self.refresh()
 
     def refresh(self) -> None:
@@ -91,6 +94,13 @@ class CityLearnBackend:
         return int(self.env.time_step)
 
     def connect(self, charger_id: str, ev_id: str, **kwargs: Any) -> None:
+        """``env.mobility.connect``. ``departure_steps`` arrives as the exact (fractional) number of steps; CityLearn
+        stores whole steps, so it is rounded up unless :attr:`allow_fractional_departure` is set for a CityLearn
+        that stores fractional countdowns. With whole steps the session dynamics learn the stop instant only in the
+        departure step (see ``docs/models.md``)."""
+        dep = kwargs.get("departure_steps")
+        if dep is not None and not self.allow_fractional_departure:
+            kwargs["departure_steps"] = max(1, math.ceil(float(dep) - 1e-9))
         self.env.mobility.connect(charger_id, ev_id, **kwargs)
 
     def incoming(self, charger_id: str, ev_id: str, **kwargs: Any) -> None:
@@ -144,9 +154,13 @@ class CityLearnBackend:
 
     def action_value(self, charger_id: str, target: ChargerTarget) -> float:
         """Normalised ``electric_vehicle_storage`` action for a target (energy over the connected seconds)."""
+        charger = self._chargers[charger_id]
+        if target.use_setpoint:  # CityLearn's session dynamics shape the power
+            power = target.setpoint_kw
+            max_p = charger.max_charging_power if power > 0 else charger.max_discharging_power
+            return float(np.clip(power / max(max_p, 1e-9), -1.0, 1.0))
         if target.connected_seconds <= 0 or target.energy_kwh == 0:
             return 0.0
-        charger = self._chargers[charger_id]
         power = target.energy_kwh * 3600.0 / target.connected_seconds
         max_p = charger.max_charging_power if power > 0 else charger.max_discharging_power
         return float(np.clip(power / max(max_p, 1e-9), -1.0, 1.0))

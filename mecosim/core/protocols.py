@@ -175,14 +175,17 @@ class ChargerTarget:
     Attributes:
         energy_kwh: Signed terminal energy of the interval (positive charges the vehicle).
         connected_seconds: Seconds the vehicle is connected within the interval.
-        setpoint_kw: Power set-point while delivering (signed), for ``timing_owner="energy_model"``.
+        setpoint_kw: Power set-point (signed). With ``use_setpoint`` the energy model applies it with its own session
+            dynamics (``timing_owner="energy_model"``); otherwise it is ``energy_kwh`` spread over the connected time.
         session_id: Session the target belongs to.
+        use_setpoint: Command the set-point instead of the interval energy.
     """
 
     energy_kwh: float
     connected_seconds: float
     setpoint_kw: float
     session_id: str
+    use_setpoint: bool = False
 
 
 # --------------------------------------------------------------------------------------------------- federates
@@ -255,6 +258,7 @@ class EnergyBackend(Protocol):
         session_id: str | None = None,
         connected_seconds: float | None = None,
         discharge_soc_floor: float | None = None,
+        connected_since_seconds: float | None = None,
     ) -> None: ...
 
     def incoming(

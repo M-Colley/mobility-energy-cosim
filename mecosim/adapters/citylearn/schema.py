@@ -12,8 +12,25 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mecosim.core.entities import Hub, VehicleSpec, Zone
+from mecosim.core.session import SessionParameters
 
-__all__ = ["SchemaPatch", "assign_buildings", "patch_schema"]
+__all__ = ["SchemaPatch", "assign_buildings", "patch_schema", "charger_dynamics_attributes"]
+
+
+def charger_dynamics_attributes(params: SessionParameters) -> dict[str, float]:
+    """CityLearn charger session-dynamics attributes (branch ``feat/charger-session-dynamics``) for ``params``.
+
+    1:1 mapping: ``start_delay_seconds`` = coupling + start-up (phases 2-3), ``setpoint_delay_seconds`` (phase 4),
+    ``ramp_up/down_kw_per_second`` (phase 5), ``stop_delay_seconds`` = decoupling (phase 6).
+    """
+    return {
+        "start_delay_seconds": params.coupling_s + params.startup_s,
+        "setpoint_delay_seconds": params.setpoint_delay_s,
+        "ramp_up_kw_per_second": params.ramp_up_kw_per_s,
+        "ramp_down_kw_per_second": params.ramp_down_kw_per_s,
+        "stop_delay_seconds": params.decoupling_s,
+    }
+
 
 _CHARGER_TYPE = "citylearn.electric_vehicle_charger.Charger"
 _BATTERY_TYPE = "citylearn.energy_model.Battery"
@@ -34,6 +51,8 @@ class SchemaPatch:
         remove_deferrables: Remove deferrable appliances (their actions are not part of this study).
         remove_existing_evs: Remove the dataset's own chargers and EVs (file schedules).
         extra_building_attributes: Optional per-building overrides merged into the building definitions.
+        session_dynamics: If given, the external chargers get CityLearn's session-dynamics attributes for these timings
+            (``timing_owner="energy_model"``); otherwise no dynamics (mecosim shapes the energy per interval).
     """
 
     charger_efficiency: float = 0.95
@@ -45,6 +64,7 @@ class SchemaPatch:
     remove_deferrables: bool = True
     remove_existing_evs: bool = True
     extra_building_attributes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    session_dynamics: SessionParameters | None = None
 
 
 def assign_buildings(schema: Mapping[str, Any], zones: Sequence[Zone], per_zone: int) -> dict[str, list[str]]:
@@ -119,6 +139,7 @@ def patch_schema(
                     "min_charging_power": 0.0,
                     "max_discharging_power": hub.power_kw,
                     "min_discharging_power": 0.0,
+                    **(charger_dynamics_attributes(opt.session_dynamics) if opt.session_dynamics else {}),
                 },
             }
     evs: dict[str, Any] = {} if opt.remove_existing_evs else dict(s.get("electric_vehicles_def", {}))

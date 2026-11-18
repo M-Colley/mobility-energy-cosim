@@ -67,8 +67,11 @@ class OrchestratorConfig:
         session: Session timing parameters (phases 2-6).
         reserve: Trip-reserve parameters.
         timing_owner: ``"mecosim"`` applies the session model's phases through per-interval energy targets;
-            ``"energy_model"`` passes plain set-points and leaves delays/ramps to the energy model (e.g. CityLearn
-            charger session dynamics), so they are not applied twice.
+            ``"energy_model"`` passes constant set-points and leaves delays, ramps and the stop to the energy model
+            (CityLearn's charger session dynamics, configured with the same parameters), so they are not applied
+            twice. Stop durations are then planned with :meth:`SessionParameters.energy_model_semantics`; connections
+            carry the plug-in offset (``connected_since_seconds``), the end offset (``connected_seconds``) and the
+            departure in (fractional, if accepted) steps.
         horizon_s: Length of the zone forecasts handed to policies (rounded up to whole master steps).
         planned_timeout_s: A planned session whose vehicle has not arrived after this time is cancelled.
         max_passenger_delay_s: Default maximum acceptable passenger delay per energy stop (policy option).
@@ -135,7 +138,10 @@ class Orchestrator:
         self.fleet = dict(fleet)
         self.config = config or OrchestratorConfig()
         self.clock = self.config.clock
-        self.session_model = SessionModel(self.config.session)
+        params = self.config.session
+        if self.config.timing_owner == "energy_model":
+            params = params.energy_model_semantics()
+        self.session_model = SessionModel(params)
         self.consumption = ConsumptionEstimator(self.config.reserve)
         self.seed = seed
         self.policy_options = dict(policy_options or {})
@@ -654,25 +660,27 @@ class Orchestrator:
                 energy = profile.energy(a - sess.arrival_s, b - sess.arrival_s)
             spec = self.fleet[sess.vehicle_id]
             first = sess.meta.get("connected_once") is None
-            dep_steps = max(1, math.ceil((dep - start) / self.clock.master_step_s - 1e-9))
-            connects[sess.charger_id] = (
-                spec.energy_id,
-                {
-                    "soc": sess.soc_arrival if first else None,
-                    "departure_steps": dep_steps,
-                    "required_soc": sess.target_soc,
-                    "session_id": sess.id,
-                    "connected_seconds": connected,
-                    "discharge_soc_floor": sess.floor_soc if sess.direction == "discharge" else None,
-                },
-            )
+            kwargs: dict[str, Any] = {
+                "soc": sess.soc_arrival if first else None,
+                "required_soc": sess.target_soc,
+                "session_id": sess.id,
+                "discharge_soc_floor": sess.floor_soc if sess.direction == "discharge" else None,
+            }
+            dynamics = self.config.timing_owner == "energy_model"
+            if dynamics:
+                # CityLearn session dynamics: offsets from the start of the step; exact departure in steps.
+                kwargs["connected_seconds"] = b - start
+                kwargs["departure_steps"] = max((dep - start) / self.clock.master_step_s, 1.0)
+                if first:
+                    kwargs["connected_since_seconds"] = -(a - start)
+                setpoint = sess.sign * sess.power_kw
+            else:
+                kwargs["connected_seconds"] = connected
+                kwargs["departure_steps"] = max(1, math.ceil((dep - start) / self.clock.master_step_s - 1e-9))
+                setpoint = energy * 3600.0 / connected
+            connects[sess.charger_id] = (spec.energy_id, kwargs)
             sess.meta["connected_once"] = 1.0
-            setpoint = (
-                sess.sign * sess.power_kw
-                if self.config.timing_owner == "energy_model"
-                else (energy * 3600.0 / connected)
-            )
-            targets[sess.charger_id] = ChargerTarget(energy, connected, setpoint, sess.id)
+            targets[sess.charger_id] = ChargerTarget(energy, connected, setpoint, sess.id, use_setpoint=dynamics)
             connected_vehicles.add(sess.vehicle_id)
         for hub in self.hubs.values():
             for p in range(hub.plugs):

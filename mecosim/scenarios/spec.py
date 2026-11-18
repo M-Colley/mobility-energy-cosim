@@ -119,7 +119,9 @@ class EnergySpec(_Model):
     carbon_kg_per_kwh: float = 0.25
     price_per_kwh: float = 0.30
     citylearn: CityLearnSpec = Field(default_factory=CityLearnSpec)
-    timing_owner: Literal["mecosim", "energy_model"] = "mecosim"
+    #: Who applies the session timing (phases 2-6): ``"auto"`` = the energy model when it supports it (CityLearn
+    #: with charger session dynamics), otherwise mecosim; ``"mecosim"``; ``"energy_model"``.
+    timing_owner: Literal["auto", "mecosim", "energy_model"] = "auto"
     #: ``"energy_model"`` (default, stock SUMO) or ``"sumo_native"`` (optional fast path, SUMO with native V2G).
     transfer: Literal["energy_model", "sumo_native"] = "energy_model"
 

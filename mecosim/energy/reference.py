@@ -165,7 +165,10 @@ class ReferenceEnergyModel:
         session_id: str | None = None,
         connected_seconds: float | None = None,
         discharge_soc_floor: float | None = None,
+        connected_since_seconds: float | None = None,
     ) -> None:
+        # connected_since_seconds is accepted for API compatibility; the reference model applies the orchestrator's
+        # per-interval energy targets, which already contain the session timing.
         if charger_id not in self._conn or ev_id not in self.evs:
             raise KeyError(f"unknown charger {charger_id!r} or EV {ev_id!r}")
         if connected_seconds is not None and not 0 <= connected_seconds <= self._step_seconds + 1e-9:

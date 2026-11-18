@@ -9,8 +9,9 @@ permissions:
   contents: read
 
 env:
-  # CityLearn with the external-mobility hook. Replace by "citylearn>=X.Y" once the hook is released.
-  CITYLEARN_SPEC: "citylearn @ git+https://github.com/M-Colley/CityLearn@feat/external-mobility-provider"
+  # CityLearn with the external-mobility hook and charger session dynamics (branch 2 contains branch 1).
+  # Replace by "citylearn>=X.Y" once both are released.
+  CITYLEARN_SPEC: "citylearn @ git+https://github.com/M-Colley/CityLearn@feat/charger-session-dynamics"
 
 jobs:
   lint:

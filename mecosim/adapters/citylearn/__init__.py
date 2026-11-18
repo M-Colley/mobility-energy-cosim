@@ -12,7 +12,24 @@ if TYPE_CHECKING:
     from mecosim.adapters.citylearn.backend import CityLearnDriver
     from mecosim.scenarios.build import BuiltScenario
 
-__all__ = ["load_schema", "resample_window", "SchemaPatch", "assign_buildings", "patch_schema", "citylearn_driver"]
+__all__ = [
+    "load_schema",
+    "resample_window",
+    "SchemaPatch",
+    "assign_buildings",
+    "patch_schema",
+    "citylearn_driver",
+    "citylearn_supports_session_dynamics",
+]
+
+
+def citylearn_supports_session_dynamics() -> bool:
+    """Whether the installed CityLearn has charger session dynamics (branch ``feat/charger-session-dynamics``)."""
+    try:
+        import citylearn.internal.charger_dynamics  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def citylearn_driver(built: BuiltScenario, patch: SchemaPatch | None = None) -> CityLearnDriver:
@@ -39,7 +56,16 @@ def citylearn_driver(built: BuiltScenario, patch: SchemaPatch | None = None) -> 
         buildings=keep,
     )
     resampled["simulation_end_time_step"] = sim.n_steps  # episode = duration (+1 terminal observation)
-    patched, _ = patch_schema(resampled, zones, zone_buildings, built.hubs, built.fleet, patch)
+    from dataclasses import replace
+
+    from mecosim.runner import resolve_timing_owner
+
+    options = patch or SchemaPatch()
+    if resolve_timing_owner(spec) == "energy_model":
+        if not citylearn_supports_session_dynamics():
+            raise RuntimeError("timing_owner='energy_model' needs CityLearn with charger session dynamics")
+        options = replace(options, session_dynamics=spec.session.parameters())
+    patched, _ = patch_schema(resampled, zones, zone_buildings, built.hubs, built.fleet, options)
     patched["central_agent"] = True
     poor = tuple(z.id for z in zones if z.role == "pv_poor") or None
     return CityLearnDriver(patched, zone_buildings, deficit_zones=poor)

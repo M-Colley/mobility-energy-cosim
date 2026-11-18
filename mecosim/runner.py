@@ -27,7 +27,20 @@ from mecosim.policies import make_policy
 from mecosim.scenarios.build import BuiltScenario, build_scenario
 from mecosim.scenarios.spec import ScenarioSpec
 
-__all__ = ["RunResult", "reference_backend", "make_orchestrator", "run_scenario"]
+__all__ = ["RunResult", "reference_backend", "make_orchestrator", "run_scenario", "resolve_timing_owner"]
+
+
+def resolve_timing_owner(spec: ScenarioSpec) -> str:
+    """``energy.timing_owner`` with ``"auto"`` resolved: CityLearn with session dynamics -> ``"energy_model"``."""
+    owner = spec.energy.timing_owner
+    if owner != "auto":
+        return owner
+    if spec.energy.backend == "citylearn":
+        from mecosim.adapters.citylearn import citylearn_supports_session_dynamics
+
+        if citylearn_supports_session_dynamics():
+            return "energy_model"
+    return "mecosim"
 
 
 @dataclass
@@ -117,7 +130,7 @@ def make_orchestrator(
         clock=clock,
         session=spec.session.parameters(),
         reserve=spec.reserve_parameters(),
-        timing_owner=spec.energy.timing_owner,
+        timing_owner=resolve_timing_owner(spec),  # type: ignore[arg-type]
         max_passenger_delay_s=spec.demand.max_passenger_delay_s,
         energy_transfer=spec.energy.transfer,
         **dict(orchestrator_options or {}),
