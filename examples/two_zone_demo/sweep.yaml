@@ -15,8 +15,10 @@ runs:
     label: optimized_epsilon
     grid: {epsilon_delay_s_per_h: [0, 300, 1800]}
   - policy: random
-objectives:
+objectives:                      # energy objectives versus traffic/service objectives
   grid_import_kwh: min
   emissions_kg: min
-  passenger_delay_per_trip_s: min
+  mean_person_wait_s: min          # passengers wait longer when vehicles are busy delivering
+  passenger_delay_per_trip_s: min  # delay from energy stops with passengers on board
+  background_mean_time_loss_s: min # traffic impact (e.g. curbside stops)
   throughput_trips_per_h: max
