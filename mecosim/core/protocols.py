@@ -63,6 +63,8 @@ class EnergyStop:
         direction: ``"discharge"`` (vehicle to building) or ``"charge"``.
         power_kw: Requested peak power; defaults to ``min(hub rating, vehicle limit)``.
         max_extra_delay_s: Optional cap on the passenger delay caused by this stop; the energy is reduced to fit.
+        after_dropoff: Serve the stop after the vehicle's current passenger tasks. With stock SUMO the orchestrator
+            defers the command until the taxi is idle (the taxi device drops stops left after the last drop-off).
     """
 
     vehicle_id: str
@@ -71,6 +73,7 @@ class EnergyStop:
     direction: Direction = "discharge"
     power_kw: float | None = None
     max_extra_delay_s: float | None = None
+    after_dropoff: bool = False
 
     def __post_init__(self) -> None:
         if not self.energy_kwh >= 0:
@@ -204,9 +207,15 @@ class MobilityFederate(Protocol):
 
     def dispatch(self, vehicle_id: str, reservation_ids: Sequence[str]) -> None: ...
 
-    def energy_stop(self, vehicle_id: str, station_id: str, duration_s: float, *, parking: bool) -> bool:
+    def energy_stop(
+        self, vehicle_id: str, station_id: str, duration_s: float, *, parking: bool, after_tasks: bool = False
+    ) -> bool:
         """Stop at ``station_id`` for ``duration_s``: inserted before the next stop if the vehicle has stops (e.g. a
-        passenger drop-off), otherwise the vehicle is routed there. Returns whether the stop was accepted."""
+        passenger drop-off), otherwise the vehicle is routed there. Returns whether the stop was accepted.
+
+        Optional federate extensions used when present: ``schedule_stop_end(vid, station, t)``,
+        ``has_planned_stop(vid, station)``, ``is_idle(vid)``, ``taxi_keeps_energy_stops(vid)`` and the native V2G
+        hooks ``native_v2g_available()``, ``native_v2g_begin/end``, ``native_total_discharged_wh``."""
         ...
 
     def set_stop_duration(self, vehicle_id: str, duration_s: float) -> None:

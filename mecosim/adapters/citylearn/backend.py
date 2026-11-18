@@ -205,7 +205,11 @@ class CityLearnDriver:
         return self._done
 
     # ------------------------------------------------------------------------------------------- KPIs
-    def kpis(self) -> dict[str, float]:
+    def kpis_light(self) -> dict[str, float]:
+        """:meth:`kpis` without CityLearn's ``evaluate()`` (cheap enough to call every step)."""
+        return self.kpis(evaluate=False)
+
+    def kpis(self, evaluate: bool = True) -> dict[str, float]:
         """Absolute KPIs from CityLearn's simulated series.
 
         Each zone is a separate energy community: its buildings are netted against each other, zones are not netted
@@ -264,6 +268,8 @@ class CityLearnDriver:
             throughput += float(np.abs(bal).sum())
             cap += float(ev.battery.capacity)
         out["equivalent_full_cycles"] = throughput / (2.0 * cap) if cap > 0 else 0.0
+        if not evaluate:
+            return out
         try:
             ev_df = env.evaluate()
             dist = ev_df[ev_df["level"] == "district"]

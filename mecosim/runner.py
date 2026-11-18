@@ -91,6 +91,7 @@ def make_orchestrator(
     port: int | None = None,
     gui: bool = False,
     sumo_extra: list[str] | None = None,
+    sumo_binary: str | None = None,
 ) -> Orchestrator:
     spec = built.spec
     sim = spec.simulation
@@ -102,6 +103,7 @@ def make_orchestrator(
         num_clients=num_clients,
         client_order=client_order,
         port=port,
+        binary=sumo_binary,
     )
     fed = SumoFederate(
         SumoFederateConfig(
@@ -116,6 +118,7 @@ def make_orchestrator(
         reserve=spec.reserve_parameters(),
         timing_owner=spec.energy.timing_owner,
         max_passenger_delay_s=spec.demand.max_passenger_delay_s,
+        energy_transfer=spec.energy.transfer,
     )
     return Orchestrator(fed, policy, built.hubs, built.zones, built.fleet, cfg, seed=spec.seed)
 

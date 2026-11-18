@@ -63,6 +63,8 @@ class SumoConnectionConfig:
         port: TraCI port; a free one is chosen when ``None``.
         host: Join an already running SUMO at ``host:port`` instead of starting one.
         label: TraCI connection label (several simulations in one process).
+        binary: Path of a SUMO executable to use instead of the one in ``SUMO_HOME`` (e.g. a development build with
+            native V2G); TraCI backend only.
     """
 
     args: list[str] = field(default_factory=list)
@@ -73,6 +75,7 @@ class SumoConnectionConfig:
     port: int | None = None
     host: str | None = None
     label: str | None = None
+    binary: str | None = None
 
 
 @dataclass
@@ -115,7 +118,7 @@ def open_connection(cfg: SumoConnectionConfig) -> SumoConnection:
 
     multi = cfg.num_clients > 1 or cfg.host is not None
     backend = cfg.backend
-    if (multi or cfg.gui) and backend == "libsumo":
+    if (multi or cfg.gui or cfg.binary) and backend == "libsumo":
         backend = "traci"
     if backend == "libsumo":
         if _LIBSUMO_ACTIVE:
@@ -137,7 +140,7 @@ def open_connection(cfg: SumoConnectionConfig) -> SumoConnection:
         owns = False
     else:
         port = cfg.port or getFreeSocketPort()
-        args = [sumo_binary("sumo-gui" if cfg.gui else "sumo")] + list(cfg.args)
+        args = [cfg.binary or sumo_binary("sumo-gui" if cfg.gui else "sumo")] + list(cfg.args)
         if cfg.num_clients > 1:
             args += ["--num-clients", str(cfg.num_clients)]
         traci.start(args, port=port, label=label, doSwitch=False)

@@ -28,6 +28,8 @@ from mecosim.core.protocols import MobilityEvent
 __all__ = ["SumoFederateConfig", "SumoFederate"]
 
 _INVALID = -1e9
+#: TraCI variable of ``chargingstation.get/setDischargePower`` in the native V2G SUMO build (sumo_api.md).
+NATIVE_V2G_VAR = 0x9E
 
 
 @dataclass
@@ -76,6 +78,9 @@ class SumoFederate:
         self._has_taxi: dict[str, bool] = {}
         self.arrived_persons: list[tuple[float, str]] = []
         self.teleports: int = 0
+        self._pending_events: list[MobilityEvent] = []
+        self._scheduled_end: dict[str, tuple[float, str]] = {}
+        self._native_discharged_wh: dict[str, float] = {}
 
     # ------------------------------------------------------------------------------------------- lifecycle
     @property
@@ -115,11 +120,13 @@ class SumoFederate:
     def advance(self, until_s: float) -> list[MobilityEvent]:
         """Step SUMO one step at a time up to ``until_s`` and collect fleet stop events (exact to one step)."""
         api = self.api
-        events: list[MobilityEvent] = []
+        events: list[MobilityEvent] = list(self._pending_events)
+        self._pending_events.clear()
         eps = 1e-6
         while self.time_s < until_s - eps:
             api.simulationStep()
             t = self.time_s
+            events.extend(self._enforce_scheduled_ends(t))
             for vid in api.simulation.getStopEndingVehiclesIDList():
                 if vid in self.fleet:
                     place = self._current_stop.pop(vid, "")
@@ -261,7 +268,14 @@ class SumoFederate:
         self.api.vehicle.dispatchTaxi(vehicle_id, list(reservation_ids))
 
     # ------------------------------------------------------------------------------------------- energy stops
-    def energy_stop(self, vehicle_id: str, station_id: str, duration_s: float, *, parking: bool) -> bool:
+    def energy_stop(
+        self, vehicle_id: str, station_id: str, duration_s: float, *, parking: bool, after_tasks: bool = False
+    ) -> bool:
+        """Plan an energy stop; see :class:`mecosim.core.protocols.MobilityFederate`.
+
+        ``after_tasks`` inserts the stop after all planned stops (only useful when SUMO keeps such stops, i.e. with
+        the native taxi-energy-stop capability; stock SUMO drops them when the last customer leaves).
+        """
         api = self.api
         tc = self.conn.constants  # type: ignore[union-attr]
         flags = tc.STOP_CHARGING_STATION | (tc.STOP_PARKING if parking else 0)
@@ -271,7 +285,8 @@ class SumoFederate:
         has_task = self._taxi_state(vehicle_id) != 0 or api.vehicle.getPersonNumber(vehicle_id) > 0
         try:
             if has_task and upcoming > 0:
-                api.vehicle.insertStop(vehicle_id, 1 if stopped else 0, station_id, duration=duration_s, flags=flags)
+                index = len(stops) if after_tasks else (1 if stopped else 0)
+                api.vehicle.insertStop(vehicle_id, index, station_id, duration=duration_s, flags=flags)
             else:
                 edge = self._lane_edge(api.chargingstation.getLaneID(station_id))
                 api.vehicle.changeTarget(vehicle_id, edge)
@@ -286,8 +301,119 @@ class SumoFederate:
         self.api.vehicle.setStopParameter(vehicle_id, 0, "duration", str(max(0.0, duration_s)))
 
     def end_stop(self, vehicle_id: str) -> None:
-        if self.api.vehicle.isStopped(vehicle_id):
+        """End the current stop now; a ``stop_end`` event is reported by the next :meth:`advance`.
+
+        SUMO does not list stops ended by ``resume`` in ``getStopEndingVehiclesIDList`` (verified with 1.28), so the
+        event is synthesised here.
+        """
+        if self.in_simulation(vehicle_id) and self.api.vehicle.isStopped(vehicle_id):
+            place = self._current_stop.pop(vehicle_id, "")
             self.api.vehicle.resume(vehicle_id)
+            self._pending_events.append(
+                MobilityEvent(
+                    "stop_end",
+                    self.time_s,
+                    vehicle_id,
+                    place,
+                    soc=self._soc(vehicle_id),
+                    odometer_km=self._odometer(vehicle_id),
+                )
+            )
+        self._scheduled_end.pop(vehicle_id, None)
+
+    def schedule_stop_end(self, vehicle_id: str, station_id: str, time_s: float) -> None:
+        """End the vehicle's stop at ``station_id`` at ``time_s`` if SUMO has not ended it by then.
+
+        Workaround for stock SUMO: the taxi device's idle algorithm turns the stop of an idle taxi into an indefinite
+        ``triggered`` wait (stop flags gain ``STOP_TRIGGERED``; verified with 1.28), so its duration never elapses.
+        """
+        self._scheduled_end[vehicle_id] = (time_s, station_id)
+
+    def _enforce_scheduled_ends(self, t: float) -> list[MobilityEvent]:
+        out: list[MobilityEvent] = []
+        for vid, (te, station) in list(self._scheduled_end.items()):
+            if t < te - 1e-6:
+                continue
+            del self._scheduled_end[vid]
+            if not self.in_simulation(vid) or not self.api.vehicle.isStopped(vid):
+                continue
+            if self._current_stop.get(vid) != station:
+                continue
+            self._current_stop.pop(vid, None)
+            self.api.vehicle.resume(vid)
+            out.append(MobilityEvent("stop_end", t, vid, station, soc=self._soc(vid), odometer_km=self._odometer(vid)))
+        return out
+
+    def has_planned_stop(self, vehicle_id: str, station_id: str) -> bool:
+        """Whether the vehicle still has an upcoming (or current) stop at ``station_id``."""
+        if not self.in_simulation(vehicle_id):
+            return False
+        return any(s.stoppingPlaceID == station_id for s in self.api.vehicle.getStops(vehicle_id))
+
+    def is_idle(self, vehicle_id: str) -> bool:
+        """Taxi state 0 (empty, no task) and nobody on board."""
+        return (
+            self.in_simulation(vehicle_id)
+            and self._taxi_state(vehicle_id) == 0
+            and self.api.vehicle.getPersonNumber(vehicle_id) == 0
+        )
+
+    # ------------------------------------------------------------------------------------------- native V2G
+    def native_v2g_available(self) -> bool:
+        """Detect native bidirectional charging (``chargingstation.getDischargePower``, TraCI variable 0x9e)."""
+        if not self.hubs:
+            return False
+        station = next(iter(self.hubs.values())).station_id
+        try:
+            fn = getattr(self.api.chargingstation, "getDischargePower", None)
+            if fn is not None:
+                fn(station)
+            elif hasattr(self.api.chargingstation, "_getUniversal"):
+                self.api.chargingstation._getUniversal(NATIVE_V2G_VAR, station)
+            else:
+                return False
+        except (AttributeError, IndexError, *self._exc):
+            return False
+        return True
+
+    def _set_discharge_power(self, station_id: str, watts: float) -> None:
+        fn = getattr(self.api.chargingstation, "setDischargePower", None)
+        if fn is not None:
+            fn(station_id, watts)
+        else:
+            self.api.chargingstation._setCmd(NATIVE_V2G_VAR, station_id, "d", watts)
+
+    def native_v2g_begin(
+        self,
+        vehicle_id: str,
+        station_id: str,
+        power_kw: float,
+        floor_soc: float,
+        efficiency: float = 1.0,
+        delay_s: float = 0.0,
+    ) -> None:
+        """Let SUMO discharge ``vehicle_id`` at ``station_id`` down to ``floor_soc`` (sumo_api.md section 5).
+
+        The station's ``efficiency`` is set to the session's terminal-to-battery efficiency and its ``chargeDelay`` to
+        the zero-power time before transfer (coupling + start-up + set-point delay); SUMO's profile is rectangular.
+        """
+        cap = self._capacity_wh(vehicle_id)
+        self.api.chargingstation.setEfficiency(station_id, efficiency)
+        self.api.chargingstation.setChargeDelay(station_id, delay_s)
+        self._set_discharge_power(station_id, power_kw * 1000.0)
+        eff = efficiency
+        self.api.vehicle.setParameter(vehicle_id, "device.battery.minimumChargeLevel", repr(floor_soc * cap))
+        self.api.vehicle.setParameter(
+            vehicle_id, "device.battery.maximumDischargeRate", repr(power_kw * 1000.0 / max(eff, 1e-9))
+        )
+        self._native_discharged_wh[vehicle_id] = self.native_total_discharged_wh(vehicle_id)
+
+    def native_v2g_end(self, vehicle_id: str) -> None:
+        if self.in_simulation(vehicle_id):
+            self.api.vehicle.setParameter(vehicle_id, "device.battery.maximumDischargeRate", "0")
+
+    def native_total_discharged_wh(self, vehicle_id: str) -> float:
+        return float(self.api.vehicle.getParameter(vehicle_id, "device.battery.totalEnergyDischarged"))
 
     # ------------------------------------------------------------------------------------------- battery
     def adjust_battery_kwh(self, vehicle_id: str, delta_kwh: float) -> float:
@@ -320,6 +446,17 @@ class SumoFederate:
             self._route_cache.clear()
         self._route_cache[key] = result
         return result
+
+    def taxi_keeps_energy_stops(self, vehicle_id: str) -> bool:
+        """Native taxi-device energy stops (SUMO branch ``taxi-energy-stops``, refs #15586), detected by the
+        ``device.taxi.keepEnergyStops`` parameter; ``False`` for released SUMO."""
+        if not self.in_simulation(vehicle_id):
+            return False
+        try:
+            value = self.api.vehicle.getParameter(vehicle_id, "device.taxi.keepEnergyStops")
+        except self._exc:
+            return False
+        return str(value).lower() in ("1", "true")
 
     def hub_of_station(self, station_id: str) -> str | None:
         return self._station_to_hub.get(station_id)

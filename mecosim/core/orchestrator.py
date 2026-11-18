@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from mecosim.core.clock import Clock
@@ -74,6 +74,14 @@ class OrchestratorConfig:
         max_passenger_delay_s: Default maximum acceptable passenger delay per energy stop (policy option).
         min_delivery_kwh: Smallest delivery executed; smaller requests are dropped.
         charging_zones: Zones whose hubs count as "next charge" for the reserve (defaults to ``pv_rich`` zones).
+        allow_dispatch_with_planned_stop: A vehicle on its way to an energy stop may be dispatched to passengers; the
+            taxi device then drops the stop (``dispatchShared`` aborts all stops), so it is re-inserted right after the
+            ``dispatchTaxi`` call (design section 4.1).
+        use_native_taxi_energy_stops: Use SUMO's native taxi energy stops (branch ``taxi-energy-stops``) when detected:
+            ``after_dropoff`` stops are inserted after the drop-off instead of waiting until the taxi is idle.
+        energy_transfer: ``"energy_model"`` (default; stock SUMO, station power 0, the energy model computes every
+            transfer and mecosim writes the SOC to SUMO) or ``"sumo_native"`` (optional fast path for SUMO builds with
+            native discharging: SUMO computes the discharge and the energy model receives the measured energy).
     """
 
     clock: Clock = field(default_factory=Clock)
@@ -85,6 +93,9 @@ class OrchestratorConfig:
     max_passenger_delay_s: float = 600.0
     min_delivery_kwh: float = 0.01
     charging_zones: tuple[str, ...] | None = None
+    allow_dispatch_with_planned_stop: bool = True
+    use_native_taxi_energy_stops: bool = False
+    energy_transfer: Literal["energy_model", "sumo_native"] = "energy_model"
 
     @property
     def horizon_steps(self) -> int:
@@ -141,6 +152,8 @@ class Orchestrator:
         self._soc_at_step_start: dict[str, float] = {}
         self._states: dict[str, VehicleState] = {}
         self._session_counter = 0
+        self._deferred: dict[str, tuple[float, EnergyStop]] = {}
+        self._native_v2g = False
         self._charging_zones = (
             self.config.charging_zones
             or tuple(z.id for z in self.zones.values() if z.role == "pv_rich")
@@ -165,6 +178,12 @@ class Orchestrator:
             if self.mobility.time_s < self.clock.begin_s:
                 self.mobility.advance(self.clock.begin_s)
         self.step = 0
+        self._deferred.clear()
+        self._native_v2g = False
+        if self.config.energy_transfer == "sumo_native":
+            detect = getattr(self.mobility, "native_v2g_available", None)
+            self._native_v2g = bool(detect and detect())
+            self.log.add("native_v2g", self.mobility.time_s, available=self._native_v2g)
         self.sessions.clear()
         self._vehicle_session.clear()
         self._plug_owner.clear()
@@ -220,6 +239,7 @@ class Orchestrator:
         n_epochs = self.clock.decisions_per_step
         epoch_len = self.clock.master_step_s / n_epochs
         for k in range(n_epochs):
+            self._maintain_stops()
             obs = self.observe(t)
             if k == 0:
                 for vid, st in obs.vehicles.items():
@@ -280,7 +300,11 @@ class Orchestrator:
 
     def _dispatch(self, cmd: DispatchTaxi) -> dict[str, Any]:
         t = self.mobility.time_s
-        if cmd.vehicle_id in self._vehicle_session:
+        sid = self._vehicle_session.get(cmd.vehicle_id)
+        planned = self.sessions[sid] if sid is not None else None
+        if planned is not None and (
+            planned.status != SessionStatus.PLANNED or not self.config.allow_dispatch_with_planned_stop
+        ):
             self.log.add("dispatch_rejected", t, vehicle=cmd.vehicle_id, reason="in_energy_session")
             return {"ok": False, "reason": "in_energy_session"}
         try:
@@ -289,7 +313,45 @@ class Orchestrator:
             self.log.add("dispatch_rejected", t, vehicle=cmd.vehicle_id, reason=str(exc))
             return {"ok": False, "reason": str(exc)}
         self.log.add("dispatch", t, vehicle=cmd.vehicle_id, reservations=",".join(cmd.reservation_ids))
+        if planned is not None:
+            # dispatchShared aborts all stops of the taxi: put the pending energy stop back (design section 4.1).
+            self._reinsert(planned, reason="after_dispatch")
         return {"ok": True}
+
+    def _reinsert(self, sess: EnergySession, reason: str) -> bool:
+        hub = self.hubs[sess.hub_id]
+        ok = self.mobility.energy_stop(
+            sess.vehicle_id, hub.station_id, sess.planned_duration_s, parking=not hub.curbside
+        )
+        t = self.mobility.time_s
+        if ok:
+            self.log.add("energy_stop_reinserted", t, vehicle=sess.vehicle_id, session=sess.id, reason=reason)
+        else:
+            sess.status = SessionStatus.CANCELLED
+            self._release(sess)
+            self.log.add(
+                "session_cancelled", t, vehicle=sess.vehicle_id, session=sess.id, reason="reinsert_failed_" + reason
+            )
+        return ok
+
+    def _maintain_stops(self) -> None:
+        """Stock-SUMO choreography: re-insert planned energy stops the taxi device dropped; run deferred stops."""
+        has_stop = getattr(self.mobility, "has_planned_stop", None)
+        if has_stop is not None:
+            for sess in list(self.sessions.values()):
+                station = self.hubs[sess.hub_id].station_id
+                if sess.status == SessionStatus.PLANNED and not has_stop(sess.vehicle_id, station):
+                    self._reinsert(sess, reason="stop_lost")
+        is_idle = getattr(self.mobility, "is_idle", None)
+        now = self.mobility.time_s
+        for vid, (since, cmd) in list(self._deferred.items()):
+            if now - since > self.config.planned_timeout_s:
+                del self._deferred[vid]
+                self.log.add("energy_stop_rejected", now, vehicle=vid, hub=cmd.hub_id, reason="deferred_timeout")
+            elif vid not in self._vehicle_session and (is_idle(vid) if is_idle else True):
+                del self._deferred[vid]
+                self._states.pop(vid, None)
+                self._energy_stop(replace(cmd, after_dropoff=False))
 
     def effective_power_kw(self, vehicle_id: str, hub_id: str, requested: float | None = None) -> float:
         """Peak power of a session: min(hub rating, vehicle limit, request)."""
@@ -336,6 +398,16 @@ class Orchestrator:
         state = self._states.get(vid) or self.mobility.vehicle_state(vid)
         if not state.in_simulation:
             return reject("not_in_simulation")
+        after_tasks = False
+        if cmd.after_dropoff and (state.persons or state.taxi_state != 0):
+            native = getattr(self.mobility, "taxi_keeps_energy_stops", None)
+            if self.config.use_native_taxi_energy_stops and native is not None and native(vid):
+                after_tasks = True
+            else:
+                # Stock SUMO drops stops left after the last drop-off: wait until the taxi is idle.
+                self._deferred[vid] = (t, cmd)
+                self.log.add("energy_stop_deferred", t, vehicle=vid, hub=cmd.hub_id, energy_kwh=cmd.energy_kwh)
+                return {"ok": True, "deferred": True}
         hub = self.hubs[cmd.hub_id]
         plug = next((p for p in range(hub.plugs) if (hub.id, p) not in self._plug_owner), None)
         if plug is None:
@@ -355,8 +427,8 @@ class Orchestrator:
         else:
             headroom = max(0.0, 1.0 - soc_arrival_est) * state.capacity_kwh / eta
             energy = min(energy, headroom)
-        mid = bool(state.persons)
-        detour_s, detour_km = est.detour_s, est.detour_km
+        mid = bool(state.persons) and not after_tasks
+        detour_s, detour_km = (est.detour_s, est.detour_km) if mid else (0.0, 0.0)
         t_to_hub = est.travel_s
         if cmd.max_extra_delay_s is not None:
             budget = cmd.max_extra_delay_s - detour_s
@@ -364,7 +436,10 @@ class Orchestrator:
         if energy < self.config.min_delivery_kwh:
             return reject("no_feasible_energy")
         duration = self.session_model.stop_duration_s(energy, power)
-        ok = self.mobility.energy_stop(vid, hub.station_id, duration, parking=not hub.curbside)
+        if after_tasks:
+            ok = self.mobility.energy_stop(vid, hub.station_id, duration, parking=not hub.curbside, after_tasks=True)
+        else:
+            ok = self.mobility.energy_stop(vid, hub.station_id, duration, parking=not hub.curbside)
         if not ok:
             return reject("simulator_rejected_stop")
         self._session_counter += 1
@@ -488,6 +563,22 @@ class Orchestrator:
         sess.profile = self.session_model.delivery_profile(energy, sess.power_kw, sess.direction)
         sess.delivered_kwh_planned = energy
         sess.status = SessionStatus.ACTIVE
+        schedule = getattr(self.mobility, "schedule_stop_end", None)
+        if schedule is not None:
+            # Stock SUMO turns an idle taxi's stop into an indefinite wait: end it at the planned time.
+            schedule(ev.vehicle_id, hub.station_id, ev.time_s + sess.planned_duration_s)
+        if self._native_v2g and sess.direction == "discharge" and sess.floor_soc is not None:
+            mob: Any = self.mobility
+            mob.native_v2g_begin(
+                ev.vehicle_id,
+                hub.station_id,
+                sess.power_kw,
+                sess.floor_soc,
+                efficiency=eta,
+                delay_s=self.session_model.params.ready_s,
+            )
+            sess.meta["native"] = 1.0
+            sess.meta["native_wh0"] = mob.native_total_discharged_wh(ev.vehicle_id)
         self.log.add(
             "session_start",
             ev.time_s,
@@ -510,6 +601,9 @@ class Orchestrator:
             return
         sess.departure_s = ev.time_s
         sess.status = SessionStatus.DONE
+        if sess.meta.get("native"):
+            mob: Any = self.mobility
+            mob.native_v2g_end(ev.vehicle_id)
         self.log.add(
             "session_end",
             ev.time_s,
@@ -540,7 +634,14 @@ class Orchestrator:
                 continue
             profile = sess.profile
             energy = 0.0
-            if profile is not None:
+            if sess.meta.get("native"):
+                # Fast path: SUMO discharged the battery in this interval; the grid side gets battery energy x eta.
+                mob: Any = self.mobility
+                total = mob.native_total_discharged_wh(sess.vehicle_id)
+                last = float(sess.meta.get("native_wh_last", sess.meta["native_wh0"]))
+                sess.meta["native_wh_last"] = total
+                energy = -(total - last) / 1000.0 * float(sess.meta.get("efficiency", 1.0))
+            elif profile is not None:
                 energy = profile.energy(a - sess.arrival_s, b - sess.arrival_s)
             spec = self.fleet[sess.vehicle_id]
             first = sess.meta.get("connected_once") is None
@@ -617,10 +718,11 @@ class Orchestrator:
             terminal = backend.charger_energy_kwh(cid)
             sess.measured_battery_kwh += delta_batt
             sess.measured_terminal_kwh += terminal
-            try:
-                self.mobility.adjust_battery_kwh(sess.vehicle_id, delta_batt)
-            except Exception:  # noqa: BLE001 - vehicle left the simulation
-                pass
+            if not sess.meta.get("native"):  # native fast path: SUMO already changed its battery
+                try:
+                    self.mobility.adjust_battery_kwh(sess.vehicle_id, delta_batt)
+                except Exception:  # noqa: BLE001 - vehicle left the simulation
+                    pass
             self.log.add(
                 "energy_interval",
                 self.clock.time_of(self.step + 1),
