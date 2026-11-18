@@ -95,7 +95,9 @@ def test_partial_interval_connected_seconds() -> None:
     assert first[3]["connected_seconds"] == pytest.approx(60.0)
     last = seen[-1]
     sess = next(iter(orch.sessions.values()))
-    dep_rel = sess.departure_s - 60.0 * last[0]
+    # the charger is free at the planned end of the stop; the mobility step releases the vehicle up to 1 s later
+    dep_rel = sess.arrival_s + sess.planned_duration_s - 60.0 * last[0]
+    assert 0.0 <= sess.departure_s - (sess.arrival_s + sess.planned_duration_s) < 1.0
     assert last[3]["connected_seconds"] == pytest.approx(dep_rel)
     assert last[3]["departure_steps"] == 1
     floors = {kw["discharge_soc_floor"] for *_, kw in seen}

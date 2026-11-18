@@ -55,9 +55,10 @@ class CityLearnBackend:
         self._carbon: np.ndarray | None = None
         self._price: np.ndarray | None = None
         #: Pass the exact departure (``connect(..., departure_seconds=...)``) to CityLearn's session dynamics:
-        #: ``True`` = always (fails on a CityLearn without it), ``None`` = when the installed CityLearn supports it
-        #: (detected from the signature of ``env.mobility.connect``), ``False`` = never (whole-step countdown only).
-        self.exact_departure: bool | None = False
+        #: ``None`` (default) = when the installed CityLearn supports it (detected from the signature of
+        #: ``env.mobility.connect``), ``True`` = always (fails on a CityLearn without it), ``False`` = never
+        #: (whole-step countdown only).
+        self.exact_departure: bool | None = None
         self._supports_departure_seconds: bool | None = None
         self.refresh()
 
@@ -119,7 +120,10 @@ class CityLearnBackend:
         session dynamics learn the stop instant only in the departure step (see ``docs/models.md``)."""
         dep_s = kwargs.pop("departure_seconds", None)
         if dep_s is not None and self.uses_departure_seconds:
+            # CityLearn derives the observed countdown (ceil(departure_seconds / step)); giving both requires them to
+            # agree, and a countdown given alone would clear the exact time, so only the exact time is sent.
             kwargs["departure_seconds"] = dep_s
+            kwargs.pop("departure_steps", None)
         dep = kwargs.get("departure_steps")
         if dep is not None:
             kwargs["departure_steps"] = max(1, math.ceil(float(dep) - 1e-9))

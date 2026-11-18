@@ -642,7 +642,10 @@ class Orchestrator:
         for sess in self.sessions.values():
             if sess.status not in (SessionStatus.ACTIVE, SessionStatus.DONE) or sess.arrival_s is None:
                 continue
-            dep = sess.departure_s if sess.departure_s is not None else sess.arrival_s + sess.planned_duration_s
+            # The charger is free at the planned end of the stop; the mobility simulator releases the vehicle at its
+            # next step (up to one step later). An earlier, interrupted stop ends the session at the actual time.
+            planned_dep = sess.arrival_s + sess.planned_duration_s
+            dep = planned_dep if sess.departure_s is None else min(sess.departure_s, planned_dep)
             a, b = max(start, sess.arrival_s), min(end, dep)
             connected = b - a
             if connected <= 0:

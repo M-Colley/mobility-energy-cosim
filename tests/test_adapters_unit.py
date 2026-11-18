@@ -205,6 +205,7 @@ def test_departure_seconds_by_capability(with_seconds: bool, mode) -> None:  # n
         return
     backend.connect("c", "ev", departure_steps=2.4, departure_seconds=84.0)
     call = backend.env.mobility.calls[-1]
-    assert call["departure_steps"] == 3  # CityLearn countdowns are whole steps
     passed = with_seconds and mode is not False
     assert ("departure_seconds" in call and call["departure_seconds"] == 84.0) is passed
+    # with the exact time CityLearn derives the countdown itself; otherwise a whole-step countdown is sent
+    assert call["departure_steps"] == (None if passed else 3)
