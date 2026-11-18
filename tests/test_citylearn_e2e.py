@@ -62,7 +62,7 @@ def test_exact_delivery_measured_by_citylearn(tmp_path: Path, energy_kwh: float)
     assert -dis.measured_battery_kwh == pytest.approx(energy_kwh / eta, rel=0.02)
     assert ch.measured_terminal_kwh == pytest.approx(1.5, rel=0.01)
     ev = next(e for e in driver.env.electric_vehicles if e.name == "av0")
-    soc = np.asarray(ev.battery.soc, dtype=float)[: driver.env.time_step + 1]  # simulated steps only
+    soc = np.asarray(ev.battery.soc, dtype=float)[: driver.env.time_step]  # steps with a transition
     assert soc.min() >= dis.floor_soc - 1e-6
     k = driver.kpis()
     assert k["ev_discharged_kwh"] == pytest.approx(-dis.measured_terminal_kwh, rel=1e-6)

@@ -135,6 +135,7 @@ class ReferenceEnergyModel:
         self._t = 0
         self._conn: dict[str, _Connection] = {cid: _Connection() for cid in self.chargers}
         self._last_energy: dict[str, float] = dict.fromkeys(self.chargers, 0.0)
+        self._carried: set[str] = set()
         self.totals = _Totals()
         self.history: list[dict[str, Any]] = []
         self.provider: Any = None
@@ -169,21 +170,43 @@ class ReferenceEnergyModel:
             raise KeyError(f"unknown charger {charger_id!r} or EV {ev_id!r}")
         if connected_seconds is not None and not 0 <= connected_seconds <= self._step_seconds + 1e-9:
             raise ValueError("connected_seconds must be within [0, step_seconds]")
+        # Same validation rules as CityLearn's env.mobility (citylearn_api.md section 4).
+        cur = self._conn[charger_id]
+        if cur.state in (1, 2) and cur.ev_id != ev_id:
+            raise ValueError(f"charger {charger_id} is occupied by {cur.ev_id}; call away() first")
+        for cid, c in self._conn.items():
+            if cid != charger_id and c.state == 1 and c.ev_id == ev_id:
+                raise ValueError(f"{ev_id} is connected to {cid}; call away() there first")
+        running = cur.state == 1 and cur.ev_id == ev_id and (session_id is None or session_id == cur.session_id)
+        if soc is not None and running and charger_id in self._carried:
+            raise ValueError("soc can only be given when the call starts a session")
         if soc is not None:
             self.evs[ev_id].soc = float(np.clip(soc, 0.0, 1.0))
         self._conn[charger_id] = _Connection(
-            1, ev_id, connected_seconds, discharge_soc_floor, session_id, departure_steps, required_soc
+            1,
+            ev_id,
+            connected_seconds,
+            discharge_soc_floor,
+            session_id or cur.session_id,
+            departure_steps,
+            required_soc,
         )
 
     def incoming(
         self, charger_id: str, ev_id: str, *, arrival_steps: int | None = None, soc_on_arrival: float | None = None
     ) -> None:
+        cur = self._conn[charger_id]
+        if cur.state == 1 or (cur.state == 2 and cur.ev_id != ev_id):
+            raise ValueError(f"charger {charger_id} is occupied by {cur.ev_id}; call away() first")
         self._conn[charger_id] = _Connection(2, ev_id)
 
     def away(self, charger_id: str) -> None:
         self._conn[charger_id] = _Connection()
 
     def set_vehicle_soc(self, ev_id: str, soc: float) -> None:
+        for cid, c in self._conn.items():
+            if c.state == 1 and c.ev_id == ev_id and cid in self._carried:
+                raise ValueError(f"{ev_id} continues a session on {cid}; its SOC is the energy model's")
         self.evs[ev_id].soc = float(np.clip(soc, 0.0, 1.0))
 
     def vehicle_soc(self, ev_id: str) -> float:
@@ -218,6 +241,7 @@ class ReferenceEnergyModel:
         self.history = []
         for k, soc in self._initial_soc.items():
             self.evs[k].soc = soc
+        self._carried = set()
         for cid in self._conn:
             self._conn[cid] = _Connection()
             self._last_energy[cid] = 0.0
@@ -290,6 +314,14 @@ class ReferenceEnergyModel:
         self.totals.peak_import_kw = max(self.totals.peak_import_kw, total_import_kw)
         self.history.append(row)
         self._t = t + 1
+        # Carry connections into the next step (they persist until away() or another write, as in CityLearn).
+        self._carried = set()
+        for cid, c in self._conn.items():
+            if c.state == 1:
+                c.connected_seconds = None
+                if c.departure_steps is not None:
+                    c.departure_steps = max(0, c.departure_steps - 1)
+                self._carried.add(cid)
         done = self._t >= self._n_steps
         if not done and self.provider is not None:
             self.provider.update(self, self._t)

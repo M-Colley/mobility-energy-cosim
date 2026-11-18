@@ -157,3 +157,29 @@ def test_max_extra_delay_shrinks_energy() -> None:
     orch.run(energy)
     (sess,) = orch.sessions.values()
     assert sess.energy_kwh == pytest.approx(1.0, rel=1e-9)
+
+
+def test_back_to_back_sessions_on_one_plug() -> None:
+    """A plug freed in one interval is reused by another vehicle: the charger must be set away before the new
+    vehicle is announced or connected (CityLearn rejects otherwise; the reference model enforces the same rule)."""
+    model = SessionModel()
+    first_end = 60.0 + model.stop_duration_s(0.5, 11.0)
+    second = 60.0 * (int(first_end // 60.0) + 1)
+    orch, _, energy = make({0.0: [EnergyStop("av0", "poor", 0.5)], second: [EnergyStop("av1", "poor", 0.5)]})
+    orch.run(energy)
+    s0, s1 = sorted(orch.sessions.values(), key=lambda s: s.command_time_s)
+    assert s0.status == SessionStatus.DONE and s1.status == SessionStatus.DONE
+    assert s1.arrival_s > s0.departure_s
+    assert -s1.measured_terminal_kwh == pytest.approx(0.5, rel=1e-9)
+
+
+def test_same_vehicle_back_to_back_on_one_plug() -> None:
+    """The same vehicle plans a new session at the plug it just left: the charger must be freed before the
+    announcement (CityLearn refuses to announce on a connected charger)."""
+    model = SessionModel()
+    first_end = 60.0 + model.stop_duration_s(0.5, 11.0)
+    second = 60.0 * (int(first_end // 60.0) + 1)
+    orch, _, energy = make({0.0: [EnergyStop("av0", "poor", 0.5)], second: [EnergyStop("av0", "poor", 0.5)]})
+    orch.run(energy)
+    sessions = sorted(orch.sessions.values(), key=lambda s: s.command_time_s)
+    assert [s.status for s in sessions] == [SessionStatus.DONE, SessionStatus.DONE]

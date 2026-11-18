@@ -153,6 +153,7 @@ class Orchestrator:
         self._states: dict[str, VehicleState] = {}
         self._session_counter = 0
         self._deferred: dict[str, tuple[float, EnergyStop]] = {}
+        self._written: dict[str, tuple[str, str] | None] = {}
         self._native_v2g = False
         self._charging_zones = (
             self.config.charging_zones
@@ -179,6 +180,7 @@ class Orchestrator:
                 self.mobility.advance(self.clock.begin_s)
         self.step = 0
         self._deferred.clear()
+        self._written.clear()
         self._native_v2g = False
         if self.config.energy_transfer == "sumo_native":
             detect = getattr(self.mobility, "native_v2g_available", None)
@@ -621,8 +623,15 @@ class Orchestrator:
         return self.backend
 
     def _write_connections(self, t: int, start: float, end: float) -> None:
+        """Write the energy model's charger rows for interval ``t`` (``[start, end)`` in mobility time).
+
+        Order matters for CityLearn's validation: chargers that become free or change vehicle are set ``away`` first,
+        then sessions are connected, then incoming vehicles are announced, then the SOC of the other vehicles is set.
+        """
         backend = self._require_backend()
         targets: dict[str, ChargerTarget] = {}
+        connects: dict[str, tuple[str, dict[str, Any]]] = {}
+        incomings: dict[str, tuple[str, dict[str, Any]]] = {}
         connected_vehicles: set[str] = set()
         for sess in self.sessions.values():
             if sess.status not in (SessionStatus.ACTIVE, SessionStatus.DONE) or sess.arrival_s is None:
@@ -646,15 +655,16 @@ class Orchestrator:
             spec = self.fleet[sess.vehicle_id]
             first = sess.meta.get("connected_once") is None
             dep_steps = max(1, math.ceil((dep - start) / self.clock.master_step_s - 1e-9))
-            backend.connect(
-                sess.charger_id,
+            connects[sess.charger_id] = (
                 spec.energy_id,
-                soc=sess.soc_arrival if first else None,
-                departure_steps=dep_steps,
-                required_soc=sess.target_soc,
-                session_id=sess.id,
-                connected_seconds=connected,
-                discharge_soc_floor=sess.floor_soc if sess.direction == "discharge" else None,
+                {
+                    "soc": sess.soc_arrival if first else None,
+                    "departure_steps": dep_steps,
+                    "required_soc": sess.target_soc,
+                    "session_id": sess.id,
+                    "connected_seconds": connected,
+                    "discharge_soc_floor": sess.floor_soc if sess.direction == "discharge" else None,
+                },
             )
             sess.meta["connected_once"] = 1.0
             setpoint = (
@@ -664,25 +674,48 @@ class Orchestrator:
             )
             targets[sess.charger_id] = ChargerTarget(energy, connected, setpoint, sess.id)
             connected_vehicles.add(sess.vehicle_id)
-        # Incoming vehicles and empty chargers.
         for hub in self.hubs.values():
             for p in range(hub.plugs):
                 cid = hub.charger_ids[p] if hub.charger_ids else f"{hub.id}_{p}"
-                if cid in targets:
+                if cid in connects:
                     continue
                 sid = self._plug_owner.get((hub.id, p))
                 sess = self.sessions.get(sid) if sid else None
                 if sess is not None and sess.status == SessionStatus.PLANNED:
                     eta = float(sess.meta.get("eta_s", end))
-                    backend.incoming(
-                        cid,
+                    incomings[cid] = (
                         self.fleet[sess.vehicle_id].energy_id,
-                        arrival_steps=max(1, self.clock.steps_until(eta, t)),
-                        soc_on_arrival=float(sess.meta.get("soc_arrival_est", 0.5)),
+                        {
+                            "arrival_steps": max(1, self.clock.steps_until(eta, t)),
+                            "soc_on_arrival": min(1.0, max(0.0, float(sess.meta.get("soc_arrival_est", 0.5)))),
+                        },
                     )
+        # 1. free chargers and chargers that change vehicle
+        for hub in self.hubs.values():
+            for p in range(hub.plugs):
+                cid = hub.charger_ids[p] if hub.charger_ids else f"{hub.id}_{p}"
+                if cid in connects:
+                    row = ("connected", connects[cid][0])
+                elif cid in incomings:
+                    row = ("incoming", incomings[cid][0])
                 else:
+                    row = None
+                prev = self._written.get(cid)
+                # CityLearn refuses to announce on a connected charger and to reuse a charger for another vehicle.
+                if (
+                    row is None
+                    or prev is None
+                    or prev[1] != row[1]
+                    or (prev[0] == "connected" and row[0] == "incoming")
+                ):
                     backend.away(cid)
-        # SOC of vehicles not connected (driving consumption from the mobility simulator).
+                self._written[cid] = row
+        # 2. connections, 3. announcements
+        for cid, (ev, kwargs) in connects.items():
+            backend.connect(cid, ev, **kwargs)
+        for cid, (ev, kwargs) in incomings.items():
+            backend.incoming(cid, ev, **kwargs)
+        # 4. SOC of vehicles not connected (driving consumption from the mobility simulator).
         for vid, spec in self.fleet.items():
             if vid in connected_vehicles:
                 continue
