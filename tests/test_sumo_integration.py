@@ -159,3 +159,70 @@ def test_stock_sumo_drops_stop_after_last_dropoff(tmp_path: Path) -> None:
         orch.close()
     assert seen.get("planned_after_insert") is True
     assert seen.get("after") is False
+
+
+def test_energy_stop_rejected_during_final_dropoff_without_teleport(tmp_path: Path) -> None:
+    """Attempting a mid-journey stop while the taxi is unloading its passenger at the final drop-off must be rejected
+    rather than resuming/rerouting and teleporting the passenger."""
+    built = tiny_built(tmp_path, **{"demand.ride_period_s": 2000, "simulation.decision_period_s": 5.0})
+    dispatch = dispatch_all_to("av0")
+
+    def fn(obs, state):  # type: ignore[no-untyped-def]
+        v = obs.vehicles["av0"]
+        if v.persons and v.stopped and v.edge_id == v.destination_edge and not state.get("tried"):
+            state["tried"] = True
+            return [EnergyStop("av0", "he", 0.4)]
+        return dispatch(obs, state)
+
+    orch, _ = run(built, Script(fn), tmp_path)
+    assert any(
+        r["kind"] == "energy_stop_rejected" and r["reason"] == "simulator_rejected_stop" for r in orch.log.records
+    )
+    assert orch.mobility.teleports == 0
+    _, persons = parse_tripinfo(tmp_path / "sumo" / "tripinfo.xml")
+    assert len(persons) >= 1
+
+
+def test_passed_station_loops_around_grid_to_reach_hub(tmp_path: Path) -> None:
+    """An idle taxi that already passed the chargingStation on the hub's own edge loops around the grid to reach it."""
+    built = tiny_built(
+        tmp_path,
+        **{
+            "demand.ride_period_s": 5000,
+            "demand.background_period_s": None,
+            "hubs": [
+                {"id": "hw", "zone": "west", "plugs": 2},
+                {"id": "he", "zone": "east", "plugs": 2, "curbside": True},
+            ],
+        },
+    )
+
+    def fn(obs, state):  # type: ignore[no-untyped-def]
+        fed = state["fed"]
+        if not state.get("moved") and obs.vehicles["av1"].in_simulation:
+            state["moved"] = True
+            he = built.hubs["he"]
+            # av1 starts on he.edge_id; place it past cs_he's endPos so energy_stop must build a loop route.
+            fed.api.vehicle.moveTo("av1", f"{he.edge_id}_0", 160.0)
+            t_loop, km_loop = fed.route_vehicle_to_hub(fed.vehicle_state("av1"), he)
+            assert t_loop > 0.0 and km_loop > 0.1
+            return [EnergyStop("av1", "he", 0.3)]
+        return []
+
+    policy = Script(fn)
+    orch = make_orchestrator(built, policy, output_dir=tmp_path / "sumo")
+    energy = reference_backend(built)
+    orig_reset = policy.reset
+
+    def reset(ctx):  # type: ignore[no-untyped-def]
+        orig_reset(ctx)
+        policy.state["fed"] = orch.mobility
+
+    policy.reset = reset  # type: ignore[method-assign]
+    try:
+        orch.run(energy)
+    finally:
+        orch.close()
+    (sess,) = orch.sessions.values()
+    assert sess.status == SessionStatus.DONE
+    assert -sess.measured_terminal_kwh == pytest.approx(0.3, rel=1e-9)

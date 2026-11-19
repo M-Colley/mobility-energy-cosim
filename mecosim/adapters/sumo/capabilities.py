@@ -34,16 +34,22 @@ def parse_version(text: str) -> tuple[int, int, int]:
     return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
 
 
-def detect_capabilities(api: object, probe_vehicle: str | None = None) -> SumoCapabilities:
+def detect_capabilities(
+    api: object,
+    probe_vehicle: str | None = None,
+    *,
+    probe_station: str | None = None,
+    exceptions: tuple[type[BaseException], ...] = (),
+) -> SumoCapabilities:
     """Query the TraCI/libsumo handle ``api`` for its version and probe optional features.
 
-    ``probe_vehicle`` is a vehicle with a battery device used to probe the native V2G parameter; without it the
-    native fast path is reported unavailable.
+    ``probe_station`` (a ``chargingStation`` id) or ``probe_vehicle`` is used to probe native V2G discharging; without
+    either the native fast path is reported unavailable.
     """
     api_version, version_string = api.getVersion()  # type: ignore[attr-defined]
     native = False
-    if probe_vehicle is not None:
+    if probe_vehicle is not None or probe_station is not None:
         from mecosim.adapters.sumo.native_v2g import probe_native_v2g
 
-        native = probe_native_v2g(api, probe_vehicle)
+        native = probe_native_v2g(api, probe_vehicle, station_id=probe_station, exceptions=exceptions)
     return SumoCapabilities(int(api_version), parse_version(str(version_string)), str(version_string), native)

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from mecosim.core.clock import Clock
 from mecosim.core.reserve import ReserveParameters
 from mecosim.core.session import COUPLING_PRESETS, SessionParameters
 
@@ -96,6 +98,16 @@ class SimulationSpec(_Model):
     mobility_step_s: float = 1.0
     start_hour: float = 10.0
     decision_period_s: float | None = None
+
+    @model_validator(mode="after")
+    def _validate_steps(self) -> SimulationSpec:
+        Clock(self.master_step_s, self.mobility_step_s, self.begin_s, self.decision_period_s)
+        if self.duration_s <= 0:
+            raise ValueError("duration_s must be > 0")
+        ratio = self.duration_s / self.master_step_s
+        if not math.isclose(ratio, round(ratio), rel_tol=0, abs_tol=1e-9):
+            raise ValueError("duration_s must be an integer multiple of master_step_s")
+        return self
 
     @property
     def n_steps(self) -> int:

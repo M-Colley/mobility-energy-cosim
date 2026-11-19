@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import math
-
+from mecosim.core.planning import estimate_stop
 from mecosim.core.protocols import Command, EnergyStop, FleetObservation
 from mecosim.policies.base import BasePolicy
 
@@ -45,7 +44,7 @@ class GreedyDeficitDispatch(BasePolicy):
     def _remaining_deficit(self, obs: FleetObservation, zone: str) -> float:
         zs = obs.zones[zone]
         planned = sum(
-            s.energy_kwh
+            max(0.0, s.energy_kwh + s.measured_terminal_kwh)
             for s in obs.sessions.values()
             if s.direction == "discharge" and self.context.hubs[s.hub_id].zone == zone
         )
@@ -115,28 +114,32 @@ class OpportunisticMidJourney(GreedyDeficitDispatch):
         poor = [z for z in (self.zones_with_role("pv_poor") or list(self.context.zones)) if z in obs.zones]
         remaining = {z: self._remaining_deficit(obs, z) for z in poor}
         slots = {z: self._concurrency_left(obs, z) for z in poor}
-        routing = self.context.routing
+        ctx = self.context
+        charging_zones = self.zones_with_role("pv_rich") or list(ctx.zones)
         for v in obs.vehicles.values():
             if v.id in busy or not v.persons or v.session_id is not None or not v.destination_edge:
                 continue
-            if v.soc < self.min_soc_to_deliver:
+            if v.soc < self.min_soc_to_deliver or any(obs.person_delays_s.get(p, 0.0) > 0.0 for p in v.persons):
                 continue
-            direct = routing.route(v.edge_id, v.destination_edge)[0]
             best = None
             for hub in self.hubs_in(poor):
-                if free.get(hub.id, 0) <= 0 or remaining.get(hub.zone, 0.0) <= 0.05 or slots.get(hub.zone, 0) <= 0:
+                if (
+                    free.get(hub.id, 0) <= 0
+                    or remaining.get(hub.zone, 0.0) <= 0.05
+                    or slots.get(hub.zone, 0) <= 0
+                    or hub.edge_id == v.destination_edge
+                ):
                     continue
-                detour = routing.route(v.edge_id, hub.edge_id)[0] + routing.route(hub.edge_id, v.destination_edge)[0]
-                detour -= direct
-                if not math.isfinite(detour) or detour > self.detour_budget_s:
+                est = estimate_stop(v, hub, ctx.hubs, charging_zones, ctx.routing, ctx.consumption, ctx.reserve)
+                if not est.feasible or est.detour_s > self.detour_budget_s:
                     continue
-                if best is None or detour < best[1]:
-                    best = (hub, detour)
+                if best is None or est.detour_s < best[1]:
+                    best = (hub, est.detour_s)
             if best is None:
                 continue
             hub, detour = best
-            power = min(hub.power_kw, self.context.vehicles[v.id].max_power_kw)
-            fit = self.context.session_model.deliverable_energy_kwh(self.delay_budget_s - max(0.0, detour), power)
+            power = min(hub.power_kw, ctx.vehicles[v.id].max_power_kw)
+            fit = ctx.session_model.deliverable_energy_kwh(self.delay_budget_s - max(0.0, detour), power)
             energy = min(self.delivery_kwh, remaining[hub.zone], fit)
             if energy < 0.05:
                 continue

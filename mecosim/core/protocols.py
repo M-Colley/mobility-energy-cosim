@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -142,6 +142,7 @@ class FleetObservation:
     hubs: Mapping[str, HubState]
     zones: Mapping[str, ZoneState]
     sessions: Mapping[str, EnergySession] = field(default_factory=dict)
+    person_delays_s: Mapping[str, float] = field(default_factory=dict)
 
 
 class RoutingOracle(Protocol):
@@ -166,6 +167,14 @@ class PolicyContext:
     routing: RoutingOracle
     seed: int = 0
     options: dict[str, Any] = field(default_factory=dict)
+    efficiency_fn: Callable[[str, str, float, Direction], float] | None = None
+
+    def efficiency(self, hub_id: str, vehicle_id: str, power_kw: float, direction: Direction) -> float:
+        """Terminal-to-battery efficiency (energy-model curves when available, else nominal hub efficiency)."""
+        if self.efficiency_fn is not None:
+            return float(self.efficiency_fn(hub_id, vehicle_id, power_kw, direction))
+        hub = self.hubs[hub_id]
+        return hub.charge_efficiency if direction == "charge" else hub.discharge_efficiency
 
 
 @dataclass(frozen=True)

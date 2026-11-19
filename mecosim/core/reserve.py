@@ -18,8 +18,8 @@ class ReserveParameters:
     """Parameters of the trip reserve.
 
     Attributes:
-        prior_kwh_per_km: Prior consumption estimate. ASSUMED default 0.20 kWh/km (configurable); replaced by the
-            measured average once the vehicle has driven ``min_distance_km``.
+        prior_kwh_per_km: Prior consumption estimate. ASSUMED default 0.20 kWh/km (configurable); combined with the
+            measured average via ``max(prior, measured)`` once the vehicle has driven ``min_distance_km``.
         uncertainty_factor: Multiplier on the consumption estimate (ASSUMED 1.2, i.e. +20 %).
         safety_margin_soc: Additional SOC margin (ASSUMED 0.05).
         min_distance_km: Distance after which the measured consumption is trusted.

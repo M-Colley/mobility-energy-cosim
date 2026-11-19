@@ -234,8 +234,16 @@ _MARKERS = {
 }
 
 
+def _fmt_param(value: Any) -> str:
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return f"{value:g}"
+    return str(value)
+
+
 def _short(row: pd.Series) -> str:
-    vals = [f"{row[c]:g}" for c in row.index if c.startswith("param.") and pd.notna(row[c])]
+    vals = [_fmt_param(row[c]) for c in row.index if c.startswith("param.") and pd.notna(row[c])]
     return ",".join(vals)
 
 

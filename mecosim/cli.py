@@ -56,6 +56,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _split(item: str) -> tuple[str, object]:
+    if "=" not in item:
+        raise SystemExit(f"bad --set {item!r}; use key=value")
     k, v = item.split("=", 1)
     return k, yaml.safe_load(v)
 
@@ -108,10 +110,24 @@ def _cmd_info(_: argparse.Namespace) -> int:
     except PackageNotFoundError:
         info["sumo"] = None
     try:
-        import citylearn
-        import citylearn.mobility  # noqa: F401
+        import inspect
 
-        info["citylearn"] = getattr(citylearn, "__version__", "?") + " (mobility hook available)"
+        import citylearn
+        import citylearn.mobility
+
+        features = ["mobility hook"]
+        from mecosim.adapters.citylearn import citylearn_supports_session_dynamics
+
+        if citylearn_supports_session_dynamics():
+            features.append("session dynamics")
+        connect_params = inspect.signature(citylearn.mobility.MobilityInterface.connect).parameters
+        if "departure_seconds" in connect_params:
+            features.append("exact departure")
+        if "charge_soc_ceiling" in connect_params:
+            features.append("charge ceiling")
+        if callable(getattr(citylearn.mobility.MobilityInterface, "transfer_efficiency", None)):
+            features.append("transfer efficiency")
+        info["citylearn"] = f"{getattr(citylearn, '__version__', '?')} ({', '.join(features)})"
     except ImportError:
         info["citylearn"] = None
     print(json.dumps(info, indent=2))

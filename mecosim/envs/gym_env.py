@@ -33,10 +33,10 @@ __all__ = ["RewardWeights", "ActionPolicy", "MecosimEnv"]
 
 @dataclass(frozen=True)
 class RewardWeights:
-    """Explicit reward weights (currency units)."""
+    """Explicit reward weights (currency units; carbon price: US EPA 2023 social cost of carbon, USD 190/t)."""
 
     energy_cost: float = 1.0
-    carbon_price_per_kg: float = 0.10
+    carbon_price_per_kg: float = 0.19
     value_of_time_per_h: float = 15.0
     deficit_served_per_kwh: float = 0.0
 
@@ -130,7 +130,7 @@ class MecosimEnv(gym.Env):
         self._steps = 0
 
     # ------------------------------------------------------------------------------------------- helpers
-    def _make(self) -> None:
+    def _make(self, seed: int | None = None) -> None:
         from mecosim.runner import make_energy_driver, make_orchestrator
 
         self.close()
@@ -141,8 +141,9 @@ class MecosimEnv(gym.Env):
             self.policy,
             output_dir=run_dir,
             sumo_backend=self.sumo_backend,  # type: ignore[arg-type]
+            seed=seed,
         )
-        self.driver = make_energy_driver(self.built)
+        self.driver = make_energy_driver(self.built, horizon_s=self.orchestrator.config.horizon_s)
 
     def _observe(self) -> np.ndarray:
         assert self.orchestrator is not None
@@ -173,19 +174,23 @@ class MecosimEnv(gym.Env):
 
     def _passenger_delay(self) -> float:
         assert self.orchestrator is not None
+        now = self.orchestrator.mobility.time_s
         total = 0.0
         for s in self.orchestrator.sessions.values():
-            if s.status == SessionStatus.DONE and s.persons_on_board_at_arrival and s.departure_s is not None:
-                total += (s.departure_s - (s.arrival_s or s.departure_s) + s.detour_s) * len(
-                    s.persons_on_board_at_arrival
-                )
+            if (
+                s.status in (SessionStatus.ACTIVE, SessionStatus.DONE)
+                and s.arrival_s is not None
+                and s.persons_on_board_at_arrival
+            ):
+                end = s.departure_s if s.departure_s is not None else min(now, s.arrival_s + s.planned_duration_s)
+                total += (max(0.0, end - s.arrival_s) + s.detour_s) * len(s.persons_on_board_at_arrival)
         return total
 
     # ------------------------------------------------------------------------------------------- gym API
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):  # type: ignore[override]
         super().reset(seed=seed)
         self._episode += 1
-        self._make()
+        self._make(seed=seed)
         assert self.orchestrator is not None
         self.driver.reset(self.orchestrator)
         self._last_totals = self._totals()

@@ -75,7 +75,9 @@ def parse_statistics(path: str | Path) -> dict[str, float]:
     return out
 
 
-def session_metrics(sessions: Iterable[EnergySession], hubs: Mapping[str, Hub]) -> dict[str, float]:
+def session_metrics(
+    sessions: Iterable[EnergySession], hubs: Mapping[str, Hub], *, end_s: float | None = None
+) -> dict[str, float]:
     """Energy-stop metrics: passenger delay, dwell, energy-delivery vehicle-km, delivered energy."""
     pax_delay = 0.0
     pax_affected = 0
@@ -87,7 +89,10 @@ def session_metrics(sessions: Iterable[EnergySession], hubs: Mapping[str, Hub]) 
     for s in sessions:
         if s.status not in (SessionStatus.DONE, SessionStatus.ACTIVE) or s.arrival_s is None:
             continue
-        dwell = (s.departure_s if s.departure_s is not None else s.arrival_s + s.planned_duration_s) - s.arrival_s
+        dep = s.departure_s if s.departure_s is not None else s.arrival_s + s.planned_duration_s
+        if end_s is not None and s.departure_s is None:
+            dep = min(dep, end_s)
+        dwell = max(0.0, dep - s.arrival_s)
         dwell_total += dwell
         if hubs[s.hub_id].curbside:
             dwell_curb += dwell
@@ -127,6 +132,8 @@ def mobility_metrics(
     sessions: Iterable[EnergySession],
     hubs: Mapping[str, Hub],
     background_prefix: str = "bg",
+    *,
+    end_s: float | None = None,
 ) -> dict[str, float]:
     """Throughput, travel/waiting times, background-traffic time loss and energy-stop metrics."""
     vehicles, persons = parse_tripinfo(tripinfo)
@@ -147,7 +154,7 @@ def mobility_metrics(
         "background_mean_travel_time_s": float(np.mean([v["duration"] for v in bg])) if bg else math.nan,
         "background_mean_time_loss_s": float(np.mean([v["timeLoss"] for v in bg])) if bg else math.nan,
     }
-    m.update(session_metrics(sessions, hubs))
+    m.update(session_metrics(sessions, hubs, end_s=end_s))
     m["passenger_delay_per_trip_s"] = (
         m["passenger_delay_energy_stops_s"] / len(done_persons) if done_persons else math.nan
     )

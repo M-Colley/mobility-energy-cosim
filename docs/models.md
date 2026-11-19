@@ -133,7 +133,9 @@ Consistency, measured in this repository:
   of arrival offsets), CityLearn keeps the set-point until the departure step and ramps down from its start. Over 60
   arrival offsets the integrator then delivers on average 12 Wh (60 s steps) and 23 Wh (15 s steps) more, at most
   62 Wh and 46 Wh; the bound is full power between the true stop instant and the start of the departure step plus one
-  ramp-down. Deliveries stay exact through the discharge floor; charges overshoot as in the table.
+  ramp-down. Deliveries stay exact through the discharge floor; when CityLearn exposes `charge_soc_ceiling`, mecosim
+  passes `charge_soc_ceiling = target_soc` so charges are capped symmetrically (older CityLearn builds without
+  `charge_soc_ceiling` overshoot up to the table bound).
 
 ## 3. Trip reserve and exact delivery
 
@@ -153,8 +155,9 @@ energy model through the session's discharge floor:
 `floor = max(floor_reserve, SOC_arrival − E / (capacity × η_d))`,
 
 where `η_d` converts terminal (AC) energy to battery energy. With CityLearn, `η_d` = charger efficiency at the planned
-power × the square root of the EV battery's power-efficiency curve at that power (CityLearn's battery applies its
-round-trip efficiency as a square root per direction); mecosim reads both from the CityLearn objects of the vehicle
+power × the square root of the EV battery's power-efficiency curve at the corresponding DC terminal power (CityLearn's
+battery applies its round-trip efficiency as a square root per direction); mecosim queries
+`env.mobility.transfer_efficiency` when available and falls back to reading both curves from the CityLearn objects
 (`CityLearnBackend.efficiency`). If the floor would cross the reserve, the delivery is reduced (`delivery_floor`). The
 reserve is recomputed with the real arrival SOC when the vehicle arrives; the stop is shortened if needed.
 
@@ -190,7 +193,11 @@ Each zone is treated as a separate energy community: buildings within a zone are
 not netted against each other. `grid_import_kwh` = Σ over zones and steps of `max(0, zone net)`; peak, emissions
 (`× carbon intensity`) and cost (`× price`) use the same zone imports. The fully netted district values are reported as
 `district_import_kwh` / `district_export_kwh`. `zone_deficit_served_kwh` = Σ over PV-poor zones and steps of
-`min(zone deficit without fleet, fleet discharge in the zone)`.
+`min(zone deficit without fleet, fleet discharge in the zone)`. `pv_self_consumption` = Σ over zones and steps of
+`clip(zone PV − zone export, 0, zone PV)` divided by total PV, so vehicle-to-building exports in PV-free zones never
+distort PV self-consumption. `runner.run_scenario` also reports `driving_energy_kwh`,
+`total_equivalent_full_cycles` (hub + driving battery throughput) and `fleet_energy_change_kwh` (end minus initial
+fleet battery energy).
 
 ### Resampling CityLearn data
 
@@ -207,10 +214,13 @@ energy totals are preserved exactly; within-hour variability is not represented.
 - decisions: binary `y[v,h,s]` (vehicle `v` stops at hub `h` starting in slot `s`) and continuous `e[v,h,s] ≥ 0` (kWh);
 - `e ≤ e_max·y`, `e ≥ e_min·y`, with `e_max` from the reserve (`(SOC_arrival − floor_reserve) × capacity × η_d`) and
   the time budget;
-- one stop per vehicle; hub connector capacity per slot (a stop occupies the slots its maximal duration covers);
-- zone deficit cap over the horizon (minus energy already planned there) and a zone power cap per slot (concurrent
-  deliveries ≤ forecast deficit power / charger power, at least one while there is a deficit), so that deliveries
-  offset local load instead of being exported;
+- one stop per vehicle; hub connector capacity per slot (a stop occupies the slots its maximal duration covers, and
+  late-slot candidates are bounded by the remaining horizon `(S − s) L`; future slots release plugs whose active
+  sessions end earlier);
+- zone deficit cap over the horizon (minus the *remaining* undelivered energy of sessions already planned or active
+  there) and a zone power cap per slot (concurrent deliveries ≤ forecast deficit power / charger power, at least one
+  while there is a deficit, minus sessions overlapping that slot), so that deliveries offset local load instead of
+  being exported;
 - time budget `(O + detour)·y + e·3600/P ≤ budget` (idle vehicles: `max_idle_stop_s`; vehicles with passengers: the
   passengers' maximum acceptable delay);
 - optional ε-constraint: cumulative passenger delay from energy stops ≤ ε × elapsed hours (then the delay weight is 0);
@@ -267,12 +277,17 @@ Verified with SUMO 1.28.0 (`eclipse-sumo` wheel) in `tests/test_sumo_integration
    vehicle … remaining stops"). Energy stops meant for after the drop-off (`EnergyStop(after_dropoff=True)`) are
    therefore deferred until the taxi is idle (taxi state 0) and then planned with the idle-redirect sequence
    `changeTarget` → `resume` → `setStop`.
-4. **The idle algorithm turns an idle taxi's energy stop into an indefinite wait**: the stop gains `STOP_TRIGGERED`
-   (flags 33 → 35) and its duration never elapses. mecosim ends such stops at the planned departure with `resume`
-   (`SumoFederate.schedule_stop_end`). SUMO does not report stops ended by `resume` in
-   `getStopEndingVehiclesIDList`, so mecosim emits that event itself.
-5. Energy stops use `parking=true` at off-street hubs (no lane blocked, no consumption) and `parking=false` at curbside
-   hubs (the stop blocks the lane; traffic impact shows in background travel times).
+4. **The idle algorithm turns an idle taxi's energy stop into an indefinite, parked wait**: the stop gains
+   `STOP_TRIGGERED` and `STOP_PARKING` (flags 33 → 35 off-street, 32 → 35 curbside) and its duration never elapses.
+   mecosim ends such stops at the planned departure with `resume` (`SumoFederate.schedule_stop_end`); SUMO does not
+   report stops ended by `resume` in `getStopEndingVehiclesIDList`, so mecosim emits that event itself. Because stock
+   SUMO's `idle-algorithm="stop"` forces `STOP_PARKING` onto idle taxis, curbside lane blocking in stock SUMO takes
+   effect on mid-journey stops (preserving `parking=false` on idle taxis requires the upstream `taxi-energy-stops`
+   branch).
+5. Energy stops request `parking=true` at off-street hubs (no lane blocked, no consumption) and `parking=false` at
+   curbside hubs (mid-journey stops block the lane; traffic impact shows in background travel times). Mid-journey stops
+   are never inserted once the vehicle has reached its final drop-off or on the drop-off edge itself, and at most one
+   mid-journey stop is scheduled per passenger ride.
 
 A SUMO branch (`taxi-energy-stops`, refs eclipse-sumo/sumo#15586) is planned to keep such stops natively. mecosim
 detects it with the vehicle parameter `device.taxi.keepChargingStops` and uses it only when

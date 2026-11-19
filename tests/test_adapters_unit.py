@@ -209,3 +209,30 @@ def test_departure_seconds_by_capability(with_seconds: bool, mode) -> None:  # n
     assert ("departure_seconds" in call and call["departure_seconds"] == 84.0) is passed
     # with the exact time CityLearn derives the countdown itself; otherwise a whole-step countdown is sent
     assert call["departure_steps"] == (None if passed else 3)
+
+
+def test_capabilities_probes_station_and_timing_owner_guards() -> None:
+    from mecosim.runner import resolve_timing_owner
+    from tests.sumo_helpers import tiny_spec
+
+    assert detect_capabilities(FakeApi(True), probe_station="cs_h", exceptions=(RuntimeError,)).native_v2g is True
+    assert detect_capabilities(FakeApi(False), probe_station="cs_h", exceptions=(RuntimeError,)).native_v2g is False
+
+    # reference backend rejects timing_owner='energy_model'
+    with pytest.raises(ValueError, match="backend='citylearn'"):
+        resolve_timing_owner(tiny_spec(**{"energy.timing_owner": "energy_model"}))
+    # sumo_native transfer resolves 'auto' to 'mecosim' and rejects 'energy_model'
+    native_auto = tiny_spec(**{"energy.backend": "citylearn", "energy.transfer": "sumo_native"})
+    assert resolve_timing_owner(native_auto) == "mecosim"
+    with pytest.raises(ValueError, match="sumo_native"):
+        resolve_timing_owner(native_auto.with_overrides({"energy.timing_owner": "energy_model"}))
+
+
+def test_simulation_spec_and_sweep_param_formatting() -> None:
+    from mecosim.sweep import _short
+    from tests.sumo_helpers import tiny_spec
+
+    with pytest.raises(ValueError, match="integer multiple"):
+        tiny_spec(**{"simulation.duration_s": 125.0, "simulation.master_step_s": 60.0})
+    row = pd.Series({"param.mode": "fast", "param.flag": True, "param.kwh": 2.5})
+    assert _short(row) == "fast,True,2.5"

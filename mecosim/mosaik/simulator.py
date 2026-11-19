@@ -123,9 +123,11 @@ class MecosimSim(mosaik_api_v3.Simulator):
         step_h = self.energy.step_seconds / 3600.0
         data: dict[str, Any] = {}
         zone_power: dict[str, float] = {}
+        charger_power: dict[str, float] = {}
         for cid, (_hub, zone) in self._charger_hub.items():
             tgt = targets.get(cid)
-            p = (tgt.energy_kwh / step_h) if tgt is not None else 0.0
+            p = (self.energy.preview_charger_energy(cid, tgt) / step_h) if tgt is not None else 0.0
+            charger_power[cid] = p
             zone_power[zone] = zone_power.get(zone, 0.0) + p
         for eid, attrs in outputs.items():
             values: dict[str, Any] = {}
@@ -134,7 +136,7 @@ class MecosimSim(mosaik_api_v3.Simulator):
                 tgt = targets.get(eid)
                 ev = self.energy._conn[eid].ev_id if tgt is not None else None
                 full = {
-                    "p_kw": (tgt.energy_kwh / step_h) if tgt is not None else 0.0,
+                    "p_kw": charger_power[eid],
                     "connected": int(tgt is not None),
                     "ev_soc": self.energy.vehicle_soc(ev) if ev else None,
                     "zone": zone,
