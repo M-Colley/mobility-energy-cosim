@@ -16,6 +16,9 @@ __all__ = [
     "probe_native_v2g",
     "probe_native_session_ramps",
     "configure_native_session_ramps",
+    "probe_native_battery_bms",
+    "configure_native_battery_bms",
+    "read_native_battery_health",
 ]
 
 #: TraCI variable of ``chargingstation.get/setDischargePower`` in the native V2G SUMO build (sumo_api.md).
@@ -91,3 +94,63 @@ def configure_native_session_ramps(
     cs.setParameter(station_id, "chargeRampDown", repr(float(dn_w_s)))
     cs.setParameter(station_id, "chargeStopDelay", repr(max(0.0, float(stop_delay_s))))
     return True
+
+
+# ----------------------------------------------------------------------------------- battery BMS bounds / SOH
+_HEALTH_KEYS = ("stateOfHealth", "effectiveCapacity", "equivalentFullCycles", "totalEnergyCharged")
+
+
+def probe_native_battery_bms(
+    api: object,
+    vehicle_id: str,
+    *,
+    exceptions: tuple[type[BaseException], ...] = (),
+) -> bool:
+    """Return whether the battery device exposes BMS SoC bounds and state of health (eclipse-sumo/sumo#18693)."""
+    try:
+        float(api.vehicle.getParameter(vehicle_id, "device.battery.stateOfHealth"))  # type: ignore[attr-defined]
+        return True
+    except (ValueError, TypeError, AttributeError, Exception, *exceptions):  # noqa: BLE001 - unsupported build
+        return False
+
+
+def configure_native_battery_bms(
+    api: object,
+    vehicle_id: str,
+    *,
+    minimum_soc: float | None = None,
+    maximum_soc: float | None = None,
+    state_of_health: float | None = None,
+    capacity_loss_per_cycle: float | None = None,
+    exceptions: tuple[type[BaseException], ...] = (),
+) -> bool:
+    """Push ISO 15118-20 style SoC bounds / SOH into SUMO's battery device; ``False`` on builds without support."""
+    if not probe_native_battery_bms(api, vehicle_id, exceptions=exceptions):
+        return False
+    values = {
+        "minimumSoC": minimum_soc,
+        "maximumSoC": maximum_soc,
+        "stateOfHealth": state_of_health,
+        "capacityLossPerCycle": capacity_loss_per_cycle,
+    }
+    for key, value in values.items():
+        if value is not None:
+            api.vehicle.setParameter(vehicle_id, f"device.battery.{key}", repr(float(value)))  # type: ignore[attr-defined]
+    return True
+
+
+def read_native_battery_health(
+    api: object,
+    vehicle_id: str,
+    *,
+    exceptions: tuple[type[BaseException], ...] = (),
+) -> dict[str, float] | None:
+    """Read SUMO's native ``stateOfHealth``, ``effectiveCapacity`` (Wh), ``equivalentFullCycles`` and
+    ``totalEnergyCharged`` (Wh); ``None`` when unsupported or the vehicle is not in the simulation."""
+    out: dict[str, float] = {}
+    try:
+        for key in _HEALTH_KEYS:
+            out[key] = float(api.vehicle.getParameter(vehicle_id, f"device.battery.{key}"))  # type: ignore[attr-defined]
+    except (ValueError, TypeError, AttributeError, Exception, *exceptions):  # noqa: BLE001 - unsupported build
+        return None
+    return out

@@ -97,6 +97,9 @@ class UKV2XProtocolEnergyDriver:
             vid: BatterySOHTracker.from_chemistry(vid, v.capacity_kwh, v.chemistry) for vid, v in built.fleet.items()
         }
         self._last_consumed_kwh: dict[str, float] = {vid: 0.0 for vid in built.fleet}
+        self._native_bms_configured: set[str] = set()
+        self._native_bms_supported: bool | None = None
+        self._native_health: dict[str, dict[str, float]] = {}
         self._archetype_value_gbp: dict[str, float] = {}
         for v in built.fleet.values():
             self._archetype_value_gbp.setdefault(v.archetype, 0.0)
@@ -295,6 +298,7 @@ class UKV2XProtocolEnergyDriver:
         # 4. Update per-vehicle Battery SOH trackers (both driving & hub cycling)
         active_hub_vids = set(target_vid.values())
         mob = getattr(self._provider, "mobility", None)
+        self._sync_native_bms(mob)
         for vid, tracker in self.soh_trackers.items():
             vspec = self.built.fleet[vid]
             soc = float(self.backend.vehicle_soc(vspec.energy_id))
@@ -336,6 +340,33 @@ class UKV2XProtocolEnergyDriver:
 
         self._step_idx += 1
         return done
+
+    def _sync_native_bms(self, mob: Any) -> None:
+        """Mirror each vehicle's ISO 15118-20 SoC window into SUMO's battery BMS (eclipse-sumo/sumo#18693) when the
+        connected build supports it, and read SUMO's native cycle/health counters for the report."""
+        if mob is None or self._native_bms_supported is False or not hasattr(mob, "api"):
+            return
+        from mecosim.adapters.sumo.native_v2g import configure_native_battery_bms, read_native_battery_health
+
+        try:
+            api, exc = mob.api, tuple(getattr(mob, "_exc", ()))
+            present = set(api.vehicle.getIDList())
+        except Exception:  # noqa: BLE001 - federate not started / closed
+            return
+        for vid, vspec in self.built.fleet.items():
+            if vid not in present:
+                continue
+            if vid not in self._native_bms_configured:
+                ok = configure_native_battery_bms(
+                    api, vid, minimum_soc=vspec.minimum_soc, maximum_soc=vspec.maximum_soc, exceptions=exc
+                )
+                self._native_bms_supported = ok
+                if not ok:
+                    return
+                self._native_bms_configured.add(vid)
+            health = read_native_battery_health(api, vid, exceptions=exc)
+            if health is not None:
+                self._native_health[vid] = health
 
     def report_bundle(self) -> dict[str, Any]:
         """Structured UKRI Competition 2613 telemetry & 2 GW scale-up bundle."""
@@ -403,7 +434,9 @@ class UKV2XProtocolEnergyDriver:
                 "ocpp21_set_profile_messages": self.ocpp21_messages,
                 "multiparty_fallback_steps": self.multiparty_fallback_steps,
                 "driver_urgent_boost_overrides": self.driver_boost_overrides,
+                "sumo_native_bms": bool(self._native_bms_supported),
             },
+            "sumo_native_battery_health": {vid: dict(h) for vid, h in self._native_health.items()},
             "soh_vehicles": [
                 {
                     "vehicle_id": s.vehicle_id,
