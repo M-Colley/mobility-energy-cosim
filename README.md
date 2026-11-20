@@ -64,10 +64,25 @@ pip install "citylearn @ git+https://github.com/M-Colley/CityLearn@feat/charger-
 pip install -e ".[dev]"                                 # or ".[rl,analysis]"
 mecosim info
 
-# one run
-mecosim run examples/two_zone_demo/scenario.yaml --policy optimized --out output/run
+# one run (pass --replay-html to also write a self-contained HTML5 replay viewer)
+mecosim run examples/two_zone_demo/scenario.yaml --policy optimized --replay-html --out output/run
 
-# the demo sweep (policies x delivery sizes x weights x epsilon budgets); CSV, Pareto set, plot
+# joint passenger + V2B + PV-charging MILP on the grid-outage mobile-microgrid demo
+mecosim run examples/outage_relief_demo/scenario.yaml --policy joint_optimized \
+  --param weights.unserved_penalty_per_kwh=5.0 --replay-html --out output/outage
+
+# native 15-minute Portuguese Renewable Energy Community (pt_rec_15 Parquet dataset)
+mecosim run examples/pt_rec_demo/scenario.yaml --policy optimized --out output/pt_rec
+
+# train the reserve-shielded RL policy (BC warm-start from OptimizedDelivery + clipped PPO)
+mecosim train-rl examples/two_zone_demo/scenario.yaml --out output/rl_policy.json
+mecosim run examples/two_zone_demo/scenario.yaml --policy rl --param checkpoint=output/rl_policy.json --out output/rl_eval
+
+# interactive HTML5 replay & Pareto/welfare explorers from existing outputs
+mecosim replay output/run --out output/run/replay.html
+mecosim pareto-html examples/two_zone_demo/output --out examples/two_zone_demo/output/pareto.html
+
+# the demo sweep (policies x delivery sizes x weights x epsilon budgets); CSV, Pareto set, plot + pareto.html
 python examples/two_zone_demo/run_demo.py --jobs 4
 # without CityLearn: the same scenario with the reference energy model and synthetic profiles
 python examples/two_zone_demo/run_demo.py --reference
@@ -184,16 +199,17 @@ Mean ± standard deviation over 3 seeds.
 
 ## Policies
 
-| Policy | Energy decision |
+| Policy | Energy & passenger decision |
 |---|---|
-| `no_delivery` | none (passenger service; recharge below 30 % SOC at the PV-rich depot) |
+| `no_delivery` | none (greedy passenger service; recharge below 30 % SOC at the PV-rich depot) |
 | `greedy_deficit` | idle vehicles deliver a fixed `delivery_kwh` to the zone with the largest forecast deficit; charge on PV surplus |
 | `opportunistic_mid_journey` | vehicles with passengers stop at a deficit hub on the way if detour and passenger delay stay within budgets (energy reduced to fit); idle vehicles as in `greedy_deficit` |
-| `optimized` | rolling-horizon MILP: where, when and how much to deliver; reserve, plugs, zone deficit cap, time budget, passenger maximum delay, optional ε-constraint on passenger delay; explicit objective weights |
+| `optimized` | rolling-horizon HiGHS MILP over V2B deliveries and co-optimised PV-surplus charging; trip reserve, shared hub plugs, zone deficit/surplus caps, passenger delay budgets, optional ε-constraint, explicit `terminal_soc_value_per_kwh` shadow price and `min_fleet_soc_delta_kwh` SOC-neutrality floor |
+| `joint_optimized` | unified rolling-horizon HiGHS MILP solving **passenger-to-taxi assignment** alongside V2B deliveries, PV-surplus charging, and ride-coupled en-route/post-dropoff V2B synergies |
+| `rl` | candidate-factored neural actor-critic (`RLDeliveryPolicy`) with exact trip-reserve safety projection, Behavioral Cloning warm-start from `OptimizedDelivery` and clipped PPO (`mecosim train-rl`) |
 | `random` | sanity baseline |
 
-All policies share the same passenger dispatch (nearest idle vehicle) and recharge rule, so they differ only in their
-energy decisions. PV-surplus top-ups are scheduled only when at most 25 % of the stop passes without energy flow
+Decoupled policies (`no_delivery`, `greedy_deficit`, `opportunistic_mid_journey`, `optimized`, `rl`, `random`) share `BasePolicy`'s greedy passenger dispatch so comparisons isolate the energy decision, while `joint_optimized` co-optimises passenger matching and energy dispatch in one MILP. PV-surplus top-ups are scheduled only when at most 25 % of the stop passes without energy flow
 (0.67 kWh at 11 kW; see docs/models.md); low-SOC recharging is never held back. Gymnasium (`mecosim.envs.MecosimEnv`) and PettingZoo (`MecosimParallelEnv`) environments expose the
 hub choice and the energy per stop (continuous, kWh) as actions; `mecosim.mosaik.MecosimSim` is a mosaik simulator.
 
@@ -212,32 +228,55 @@ mecosim and CARLA's SUMO co-simulation bridge run as two TraCI clients of one SU
 `setOrder`), at the bridge's 0.05 s step. See [docs/carla.md](docs/carla.md). Lockstep is tested with a stub client
 that mimics the bridge; CARLA itself was not run.
 
+## Multiparty V2X standards, battery SOH & UK 2 GW flexibility pack (`v2x-interop` + `mecosim ukri-report`)
+
+Reusable standards and UK distribution-network primitives live in the standalone
+[`v2x-interop`](https://github.com/M-Colley/v2x-interop) package (`ISO 15118-20` Dynamic/Scheduled BPT envelopes,
+`OCPP 2.1` bidirectional `SetChargingProfile` wire codecs, `OpenADR 3.0` events, 5-party HMAC-authenticated session
+arbitration, the 12-case **IEA Task 53** interoperability matrix, `NMC811`/`LFP` battery SOH calendar-vs-driving-vs-V2X
+wear attribution, UK half-hourly seasonal Agile/DFS/NESO profiles, **ENA G99/G100** LV feeder envelopes with statutory
+230 V +10 %/−6 % voltage checks, UK DSO `Sustain`/`Secure`/`Dynamic`/`Restore` settlement, and Monte Carlo `P50`/`P90`
+extrapolation to the **UK 2030 2 GW Consumer-Led Flexibility** target across all 6 UK DNO groups).
+
+In `mecosim`, set `uk_v2x.enabled: true` and optional heterogeneous `fleet_archetypes` (`domestic_v2h`,
+`kerbside_public`, `commercial_depot`, `utility_v2l`, `ride_hail` — see `examples/uk_v2x_2030_demo/scenario.yaml`), or
+generate a full multi-seasonal evidence pack and interactive HTML5 explorer with one command:
+
+```bash
+mecosim ukri-report examples/uk_v2x_2030_demo/scenario.yaml --policy optimized --out output/ukri_2030
+```
+
 ## Limitations
 
 - **CARLA not run**: the integration follows CARLA's bridge source and is tested with a stub client only.
 - **CityLearn features unreleased**: requires the `feat/charger-session-dynamics` branch (external-mobility hook plus
   session dynamics); CI installs it from git.
-- **Data resolution**: CityLearn datasets are hourly; mecosim holds intensive values and splits energies within each
-  hour (hourly totals preserved, no intra-hour variability). Zones are energy communities without internal grid
-  constraints. Zone-deficit forecasts handed to policies use a nominal COP of 3 for thermal demand.
+- **Data resolution & grid outages**: hourly CityLearn datasets hold intensive values and split energies within each
+  hour, while native sub-hourly CSV/Parquet datasets (e.g. 15-minute `pt_rec_*` communities in `examples/pt_rec_demo`
+  and 15-second three-phase datasets) are sliced, sub-stepped or aggregated directly. Zone-level feeder import caps and
+  scheduled blackouts are supported via `energy.outages` (`examples/outage_relief_demo`), reporting
+  `unserved_energy_kwh` and `outage_relief_kwh`. Zone-deficit forecasts use a nominal COP of 3 for thermal demand.
 - **Stock SUMO taxi device** drops energy stops on re-dispatch and after the last drop-off, and its `stop` idle
   algorithm forces `STOP_TRIGGERED | STOP_PARKING` onto idle taxis' stops (so curbside lane blocking in stock SUMO
   takes effect on mid-journey stops); the workaround re-inserts stops after each dispatch, delays post-drop-off stops
   until the taxi is idle and ends idle stops on time with `resume`. A native fix (SUMO branch `taxi-energy-stops`, refs
   eclipse-sumo/sumo#15586) is detected but off by default.
-- **Native SUMO V2G** (fast path) needs an unreleased SUMO build; it is off by default and uses a rectangular power
-  profile with `chargeDelay` (no ramps).
-- **Assumed values**: the wireless and pantograph coupling presets, the consumption prior (0.20 kWh/km), the reserve
-  margin and factor, and all objective and welfare weights are assumptions; sweep them.
+- **Native SUMO V2G** (fast path) needs an unreleased SUMO build; it is off by default (`energy.transfer: energy_model`)
+  and automatically configures trapezoidal `chargeRampUp`, `chargeRampDown` and `chargeStopDelay` when supported by the
+  connected SUMO build, falling back to `chargeDelay` on rectangular builds.
+- **Assumed values & adaptive reserve**: the wireless and pantograph coupling presets, the default consumption prior
+  (0.20 kWh/km), and objective/welfare weights are configurable assumptions; enable online per-edge Bayesian + UCB
+  consumption learning via `reserve.adaptive_ucb_z` and `reserve.edge_prior_km` (`AdaptiveConsumptionEstimator`).
 - **Timing**: by default CityLearn's charger session dynamics apply the stop timing (start delay, set-point delay,
   ramps, stop delay) with mecosim's cited parameters; mecosim plans stop durations with the same semantics and passes
   the exact departure (`departure_seconds`). Measured agreement with the plan: deliveries below 0.0001 %, charges at
   most +0.0001 Wh. With CityLearn versions without `departure_seconds` the stop instant is known only in the departure
   step: deliveries stay within ±0.13 % (discharge floor), charges overshoot by up to 62 Wh. Without session dynamics
   (`timing_owner: mecosim`) the measured energy of a delivery is within 1 % of the request.
-- **No terminal-SOC valuation**: the objectives do not value the fleet's energy at the end of the horizon, so policies
-  that discharge without recharging (e.g. `random` in the demo) look better than they are; compare charged and
-  delivered energy, or extend the horizon.
+- **Terminal-SOC valuation**: by default `terminal_soc_value_per_kwh` is `0.0` (so horizon-myopic policies such as
+  `random` in the demo can draw down fleet SOC); set `weights.terminal_soc_value_per_kwh > 0`,
+  `min_fleet_soc_delta_kwh=0.0` (SOC-neutrality floor) or `welfare_weights["fleet_energy_change_kwh"]` to value
+  retained battery energy explicitly.
 - **Zone netting**: benefits depend on zones being separate energy communities or feeders; with a fully netted district
   the demo's PV-rich zone would cover the PV-poor zone without any vehicle.
 - PettingZoo agents are vehicles only (no hub or building agents); building control stays with CityLearn's controller.

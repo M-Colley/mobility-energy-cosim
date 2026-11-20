@@ -22,7 +22,12 @@ from pathlib import Path
 
 from mecosim.adapters.sumo.capabilities import SumoCapabilities, detect_capabilities
 from mecosim.adapters.sumo.connection import SumoConnection, SumoConnectionConfig, open_connection
-from mecosim.adapters.sumo.native_v2g import NATIVE_V2G_VAR, probe_native_v2g
+from mecosim.adapters.sumo.native_v2g import (
+    NATIVE_V2G_VAR,
+    configure_native_session_ramps,
+    probe_native_session_ramps,
+    probe_native_v2g,
+)
 from mecosim.core.entities import Hub, RideRequest, VehicleSpec, VehicleState
 from mecosim.core.protocols import MobilityEvent
 
@@ -72,6 +77,8 @@ class SumoFederate:
         self._station_to_hub = {h.station_id: h.id for h in self.hubs.values()}
         self._station_meta: dict[str, tuple[str, float, float, float, float]] = {}
         self._route_cache: dict[tuple[str, str, int], tuple[float, float]] = {}
+        self._route_edges_cache: dict[tuple[str, str, int], list[tuple[str, float]]] = {}
+        self._edge_len_km: dict[str, float] = {}
         self._current_stop: dict[str, str] = {}
         self._ids: set[str] = set()
         self._ids_time = -1.0
@@ -445,6 +452,13 @@ class SumoFederate:
         else:
             self.api.chargingstation._setCmd(NATIVE_V2G_VAR, station_id, "d", watts)
 
+    def native_session_ramps_available(self) -> bool:
+        """Detect native trapezoidal ramp/stop-delay support on SUMO ``chargingStation``."""
+        if not self.hubs:
+            return False
+        station = next(iter(self.hubs.values())).station_id
+        return probe_native_session_ramps(self.api, station, exceptions=self._exc)
+
     def native_v2g_begin(
         self,
         vehicle_id: str,
@@ -453,12 +467,11 @@ class SumoFederate:
         floor_soc: float,
         efficiency: float = 1.0,
         delay_s: float = 0.0,
+        ramp_up_kw_per_s: float = math.inf,
+        ramp_down_kw_per_s: float = math.inf,
+        stop_delay_s: float = 0.0,
     ) -> None:
-        """Let SUMO discharge ``vehicle_id`` at ``station_id`` down to ``floor_soc`` (sumo_api.md section 5).
-
-        The station's ``efficiency`` is set to the session's terminal-to-battery efficiency and its ``chargeDelay`` to
-        the zero-power time before transfer (coupling + start-up + set-point delay); SUMO's profile is rectangular.
-        """
+        """Let SUMO discharge ``vehicle_id`` at ``station_id`` down to ``floor_soc`` (sumo_api.md section 5)."""
         for other in self.fleet:
             if other != vehicle_id and other not in self._active_native_v2g and self.in_simulation(other):
                 try:
@@ -468,6 +481,14 @@ class SumoFederate:
         cap = self._capacity_wh(vehicle_id)
         self.api.chargingstation.setEfficiency(station_id, efficiency)
         self.api.chargingstation.setChargeDelay(station_id, delay_s)
+        configure_native_session_ramps(
+            self.api,
+            station_id,
+            ramp_up_kw_per_s=ramp_up_kw_per_s,
+            ramp_down_kw_per_s=ramp_down_kw_per_s,
+            stop_delay_s=stop_delay_s,
+            exceptions=self._exc,
+        )
         self._set_discharge_power(station_id, power_kw * 1000.0)
         eff = efficiency
         self.api.vehicle.setParameter(vehicle_id, "device.battery.minimumChargeLevel", repr(floor_soc * cap))
@@ -517,6 +538,40 @@ class SumoFederate:
             self._route_cache.clear()
         self._route_cache[key] = result
         return result
+
+    def route_edges(self, from_edge: str, to_edge: str) -> list[tuple[str, float]]:
+        """Fastest route as ``[(edge_id, length_km), ...]`` (empty if unreachable or trivial)."""
+        if not from_edge or not to_edge:
+            return []
+        if from_edge == to_edge:
+            km = self._edge_length_km(from_edge)
+            return [(from_edge, km)] if km > 0 else []
+        bucket = int(self.time_s // max(1.0, self.config.route_cache_s))
+        key = (from_edge, to_edge, bucket)
+        hit = self._route_edges_cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            stage = self.api.simulation.findRoute(from_edge, to_edge, vType=self.config.routing_vtype)
+            edges = [str(e) for e in stage.edges if not str(e).startswith(":")]
+            result = [(eid, self._edge_length_km(eid)) for eid in edges] if edges else []
+        except self._exc:
+            result = []
+        if len(self._route_edges_cache) > 50000:
+            self._route_edges_cache.clear()
+        self._route_edges_cache[key] = result
+        return result
+
+    def _edge_length_km(self, edge_id: str) -> float:
+        hit = self._edge_len_km.get(edge_id)
+        if hit is not None:
+            return hit
+        try:
+            km = max(0.0, float(self.api.lane.getLength(edge_id + "_0")) / 1000.0)
+        except self._exc:
+            km = 0.0
+        self._edge_len_km[edge_id] = km
+        return km
 
     def route_vehicle_to_hub(self, v: VehicleState, hub: Hub) -> tuple[float, float]:
         """Position-aware travel ``(time_s, length_km)`` from ``v`` to ``hub`` (accounts for passed stations)."""

@@ -1,0 +1,64 @@
+# Outage-relief / mobile-microgrid demo: a 100-minute feeder outage islands the PV-poor east zone while the PV-rich
+# west zone remains energized with afternoon solar surplus. Automated electric taxis act as a mobile microgrid,
+# charging on west-side PV and discharging into east-side hubs to cut unserved load while continuing to serve rides.
+name: outage_relief_demo
+seed: 7
+simulation:
+  begin_s: 0
+  duration_s: 7200           # 2 h, 12:00-14:00
+  master_step_s: 60
+  mobility_step_s: 1.0
+  start_hour: 12
+network:
+  kind: grid
+  grid_number: 5
+  grid_length_m: 220
+  lanes: 1
+  speed_mps: 13.89
+zones:
+  - id: west
+    role: pv_rich
+    x_range: [0.0, 0.5]
+    pv_scale: 4.0
+    pv_kwp: 45
+    load_kw_mean: 10
+    buildings: [Building_1, Building_2, Building_3, Building_4]
+  - id: east
+    role: pv_poor
+    x_range: [0.5, 1.0]
+    pv_scale: 0.0
+    pv_kwp: 0
+    load_kw_mean: 18
+    buildings: [Building_6, Building_7, Building_8, Building_9, Building_10]
+hubs:
+  - {id: depot_west, zone: west, plugs: 4, power_kw: 11.0}
+  - {id: microgrid_east_a, zone: east, plugs: 3, power_kw: 11.0}
+  - {id: microgrid_east_b, zone: east, plugs: 2, power_kw: 11.0, curbside: true}
+fleet:
+  n_vehicles: 8
+  capacity_kwh: 60
+  max_power_kw: 11
+  initial_soc: 0.75
+demand:
+  ride_period_s: 120
+  ride_min_distance_m: 500
+  max_passenger_delay_s: 600
+  background_period_s: 6
+energy:
+  backend: citylearn
+  timing_owner: auto
+  carbon_kg_per_kwh: 0.25
+  price_per_kwh: 0.30
+  outages:
+    - {zone: east, start_s: 600, end_s: 6600, max_import_kw: 0.0}
+  citylearn:
+    dataset: citylearn_challenge_2022_phase_all_plus_evs
+    start_time_step: 132
+session:
+  preset: robotic_conductive
+reserve:
+  prior_kwh_per_km: 0.20
+  uncertainty_factor: 1.0
+  adaptive_ucb_z: 1.645
+  edge_prior_km: 1.0
+  safety_margin_soc: 0.05

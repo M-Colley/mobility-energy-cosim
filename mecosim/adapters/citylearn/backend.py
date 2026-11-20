@@ -44,10 +44,17 @@ class CityLearnBackend:
         forecast: Forecast options.
     """
 
-    def __init__(self, env: Any, zone_buildings: Mapping[str, list[str]], forecast: ForecastOptions | None = None):
+    def __init__(
+        self,
+        env: Any,
+        zone_buildings: Mapping[str, list[str]],
+        forecast: ForecastOptions | None = None,
+        zone_import_caps_kw: Mapping[str, np.ndarray] | None = None,
+    ):
         self.env = env
         self.zone_buildings = {z: list(bs) for z, bs in zone_buildings.items()}
         self.forecast = forecast or ForecastOptions()
+        self.zone_import_caps_kw = {z: np.asarray(a, dtype=float) for z, a in (zone_import_caps_kw or {}).items()}
         self._chargers: dict[str, Any] = {}
         self._evs: dict[str, Any] = {}
         self._zone_load: dict[str, np.ndarray] = {}
@@ -182,12 +189,19 @@ class CityLearnBackend:
     def zone_state(self, zone_id: str, step: int, horizon: int) -> ZoneState:
         h = self.step_seconds / 3600.0
         load, pv = self._zone_load[zone_id], self._zone_pv[zone_id]
+        caps = self.zone_import_caps_kw.get(zone_id)
         deficits, surpluses = [], []
+        any_outage = False
         for k in range(step, step + max(1, horizon)):
             net = self._at(load, k) - self._at(pv, k)
             deficits.append(max(0.0, net))
             surpluses.append(max(0.0, -net))
+            if caps is not None:
+                cap_k = self._at(caps, k)
+                if cap_k <= 1e-9 or (math.isfinite(cap_k) and max(0.0, net) / h > cap_k + 1e-9):
+                    any_outage = True
         net0 = self._at(load, step) - self._at(pv, step)
+        cap0 = self._at(caps, step) if caps is not None else math.inf
         assert self._carbon is not None and self._price is not None
         return ZoneState(
             id=zone_id,
@@ -197,6 +211,8 @@ class CityLearnBackend:
             surplus_forecast_kwh=tuple(surpluses),
             carbon_intensity_kg_per_kwh=self._at(self._carbon, step),
             price_per_kwh=self._at(self._price, step),
+            outage=bool(cap0 <= 1e-9 or any_outage),
+            max_import_kw=cap0,
         )
 
     # ------------------------------------------------------------------------------------------- efficiency
@@ -245,6 +261,7 @@ class CityLearnDriver:
         env_kwargs: Mapping[str, Any] | None = None,
         forecast: ForecastOptions | None = None,
         building_actions: Literal["none", "rbc"] = "none",
+        zone_import_caps_kw: Mapping[str, np.ndarray] | None = None,
     ) -> None:
         from citylearn.citylearn import CityLearnEnv
 
@@ -252,10 +269,11 @@ class CityLearnDriver:
         self.zone_buildings = {z: list(b) for z, b in zone_buildings.items()}
         self.deficit_zones = deficit_zones or tuple(self.zone_buildings)
         self.building_actions = building_actions
+        self.zone_import_caps_kw = {z: np.asarray(a, dtype=float) for z, a in (zone_import_caps_kw or {}).items()}
         central = bool(self.schema.get("central_agent", True))
         kw = {"central_agent": central, **dict(env_kwargs or {})}
         self.env = CityLearnEnv(self.schema, **kw)
-        self.backend = CityLearnBackend(self.env, self.zone_buildings, forecast)
+        self.backend = CityLearnBackend(self.env, self.zone_buildings, forecast, self.zone_import_caps_kw)
         self._action_names: list[list[str]] = [list(names) for names in self.env.action_names]
         self._rbc: Any = None
         if building_actions == "rbc":
@@ -320,6 +338,7 @@ class CityLearnDriver:
         pv = pv_used = 0.0
         ev_ch = ev_dis = 0.0
         deficit = served = 0.0
+        unserved_base = unserved = 0.0
         for zone, names in self.zone_buildings.items():
             zone_net = np.zeros(n)
             zone_ev = np.zeros(n)
@@ -330,12 +349,24 @@ class CityLearnDriver:
                 zone_pv += -np.asarray(b.solar_generation, dtype=float)[:n]
                 for c in getattr(b, "electric_vehicle_chargers", None) or []:
                     zone_ev += np.asarray(c.electricity_consumption, dtype=float)[:n]
-            zimp = np.clip(zone_net, 0.0, None)
-            zexp = np.clip(-zone_net, 0.0, None)
+            raw_zimp = np.clip(zone_net, 0.0, None)
+            raw_zexp = np.clip(-zone_net, 0.0, None)
+            caps = self.zone_import_caps_kw.get(zone)
+            if caps is not None and n > 0:
+                cap_kw = caps[:n] if len(caps) >= n else np.pad(caps, (0, n - len(caps)), constant_values=caps[-1])
+                cap_kwh = np.where(np.isfinite(cap_kw), cap_kw * h, np.inf)
+                zimp = np.minimum(raw_zimp, cap_kwh)
+                zexp = np.where(cap_kw <= 1e-9, 0.0, raw_zexp)
+                unserved += float(np.maximum(raw_zimp - cap_kwh, 0.0).sum())
+                base_zimp = np.clip(zone_net - zone_ev, 0.0, None)
+                unserved_base += float(np.maximum(base_zimp - cap_kwh, 0.0).sum())
+            else:
+                zimp = raw_zimp
+                zexp = raw_zexp
             imp_total += zimp
             exp_total += zexp
             pv += float(zone_pv.sum())
-            pv_used += float(np.clip(zone_pv - zexp, 0.0, zone_pv).sum())
+            pv_used += float(np.clip(zone_pv - raw_zexp, 0.0, zone_pv).sum())
             ev_ch += float(np.clip(zone_ev, 0, None).sum())
             ev_dis += float(np.clip(-zone_ev, 0, None).sum())
             out[f"import_kwh_{zone}"] = float(zimp.sum())
@@ -357,6 +388,9 @@ class CityLearnDriver:
         out["ev_discharged_kwh"] = ev_dis
         out["zone_deficit_kwh"] = deficit
         out["zone_deficit_served_kwh"] = served
+        out["unserved_baseline_kwh"] = unserved_base
+        out["unserved_energy_kwh"] = unserved
+        out["outage_relief_kwh"] = max(0.0, unserved_base - unserved)
         throughput = 0.0
         cap = 0.0
         for ev in env.electric_vehicles:

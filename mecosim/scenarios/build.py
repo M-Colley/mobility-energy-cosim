@@ -181,29 +181,95 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
 
     # ---------------------------------------------------------------------------------- fleet
     fleet: dict[str, VehicleSpec] = {}
-    fs = spec.fleet
-    params = {"device.battery.capacity": fs.capacity_kwh * 1000.0, **fs.energy_params}
-    vtype_params = "\n".join(f'    <param key="{k}" value="{v}"/>' for k, v in params.items())
-    vehicles = []
     hub_list = list(hubs.values())
-    for i in range(fs.n_vehicles):
-        vid = f"{fs.id_prefix}{i}"
-        hub = hub_list[i % len(hub_list)]
-        vehicles.append(
-            f'  <vehicle id="{vid}" type="av_taxi" depart="{sim.begin_s:.1f}" line="taxi" departPos="base">\n'
-            f'    <route edges="{hub.edge_id}"/>\n'
-            f'    <param key="device.battery.chargeLevel" value="{fs.initial_soc * fs.capacity_kwh * 1000.0:.3f}"/>\n'
-            f"  </vehicle>"
+    vtypes_xml: list[str] = []
+    vehicles: list[str] = []
+
+    if spec.fleet_archetypes:
+        # Always include a baseline "av_taxi" vType for routing_vtype compatibility
+        base_cap_wh = spec.fleet_archetypes[0].capacity_kwh * 1000.0
+        vtypes_xml.append(
+            f'  <vType id="av_taxi" vClass="taxi" personCapacity="4" emissionClass="Energy/unknown">\n'
+            '    <param key="has.battery.device" value="true"/>\n'
+            '    <param key="has.taxi.device" value="true"/>\n'
+            f'    <param key="device.battery.capacity" value="{base_cap_wh:.1f}"/>\n'
+            "  </vType>"
         )
-        fleet[vid] = VehicleSpec(vid, fs.capacity_kwh, fs.max_power_kw, fs.initial_soc, ev_id=vid)
+        for arch in spec.fleet_archetypes:
+            vtype_id = f"vt_{arch.id}"
+            params = {"device.battery.capacity": arch.capacity_kwh * 1000.0, **arch.energy_params}
+            vtype_params = "\n".join(f'    <param key="{k}" value="{v}"/>' for k, v in params.items())
+            vtypes_xml.append(
+                f'  <vType id={quoteattr(vtype_id)} vClass="taxi" personCapacity="{arch.person_capacity}" '
+                'emissionClass="Energy/unknown">\n'
+                '    <param key="has.battery.device" value="true"/>\n'
+                '    <param key="has.taxi.device" value="true"/>\n'
+                f"{vtype_params}\n"
+                "  </vType>"
+            )
+            zone_hubs = [h for h in hub_list if arch.home_zone is None or h.zone == arch.home_zone] or hub_list
+            prefix = arch.id_prefix or arch.id
+            for i in range(arch.n_vehicles):
+                vid = f"{prefix}_{i}"
+                hub = zone_hubs[i % len(zone_hubs)]
+                init_wh = arch.initial_soc * arch.capacity_kwh * 1000.0
+                vehicles.append(
+                    f'  <vehicle id={quoteattr(vid)} type={quoteattr(vtype_id)} depart="{sim.begin_s:.1f}" '
+                    'line="taxi" departPos="base">\n'
+                    f'    <route edges="{hub.edge_id}"/>\n'
+                    f'    <param key="device.battery.chargeLevel" value="{init_wh:.3f}"/>\n'
+                    "  </vehicle>"
+                )
+                fleet[vid] = VehicleSpec(
+                    vid,
+                    arch.capacity_kwh,
+                    arch.max_power_kw,
+                    arch.initial_soc,
+                    ev_id=vid,
+                    archetype=arch.role,
+                    chemistry=arch.chemistry,
+                    minimum_soc=arch.minimum_soc,
+                    target_soc=arch.target_soc,
+                    maximum_soc=arch.maximum_soc,
+                    transfer_mode=arch.transfer_mode,
+                )
+    else:
+        fs = spec.fleet
+        params = {"device.battery.capacity": fs.capacity_kwh * 1000.0, **fs.energy_params}
+        vtype_params = "\n".join(f'    <param key="{k}" value="{v}"/>' for k, v in params.items())
+        vtypes_xml.append(
+            f'  <vType id="av_taxi" vClass="taxi" personCapacity="{fs.person_capacity}" '
+            'emissionClass="Energy/unknown">\n'
+            '    <param key="has.battery.device" value="true"/>\n'
+            '    <param key="has.taxi.device" value="true"/>\n'
+            f"{vtype_params}\n"
+            "  </vType>"
+        )
+        for i in range(fs.n_vehicles):
+            vid = f"{fs.id_prefix}{i}"
+            hub = hub_list[i % len(hub_list)]
+            init_wh = fs.initial_soc * fs.capacity_kwh * 1000.0
+            vehicles.append(
+                f'  <vehicle id="{vid}" type="av_taxi" depart="{sim.begin_s:.1f}" line="taxi" departPos="base">\n'
+                f'    <route edges="{hub.edge_id}"/>\n'
+                f'    <param key="device.battery.chargeLevel" value="{init_wh:.3f}"/>\n'
+                f"  </vehicle>"
+            )
+            fleet[vid] = VehicleSpec(
+                vid,
+                fs.capacity_kwh,
+                fs.max_power_kw,
+                fs.initial_soc,
+                ev_id=vid,
+                chemistry=fs.chemistry,
+                minimum_soc=fs.minimum_soc,
+                target_soc=fs.target_soc,
+                maximum_soc=fs.maximum_soc,
+                transfer_mode=fs.transfer_mode,
+            )
     fleet_file = out / "fleet.rou.xml"
     fleet_file.write_text(
-        "<routes>\n"
-        f'  <vType id="av_taxi" vClass="taxi" personCapacity="{fs.person_capacity}" emissionClass="Energy/unknown">\n'
-        '    <param key="has.battery.device" value="true"/>\n'
-        '    <param key="has.taxi.device" value="true"/>\n'
-        f"{vtype_params}\n"
-        "  </vType>\n" + "\n".join(vehicles) + "\n</routes>\n",
+        "<routes>\n" + "\n".join(vtypes_xml) + "\n" + "\n".join(vehicles) + "\n</routes>\n",
         encoding="utf-8",
     )
 

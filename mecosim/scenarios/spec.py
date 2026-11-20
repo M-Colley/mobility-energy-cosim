@@ -18,11 +18,14 @@ __all__ = [
     "ZoneSpec",
     "HubSpec",
     "FleetSpec",
+    "FleetArchetypeSpec",
     "DemandSpec",
     "SimulationSpec",
     "CityLearnSpec",
+    "OutageWindow",
     "EnergySpec",
     "SessionSpec",
+    "UKV2XSpec",
     "ScenarioSpec",
 ]
 
@@ -77,7 +80,32 @@ class FleetSpec(_Model):
     max_power_kw: float = 11.0
     initial_soc: float = 0.8
     person_capacity: int = 4
+    chemistry: Literal["NMC811", "LFP"] = "NMC811"
+    minimum_soc: float = 0.20
+    target_soc: float = 0.80
+    maximum_soc: float = 0.95
+    transfer_mode: Literal["AC_single_phase", "AC_three_phase", "DC"] = "AC_single_phase"
     #: SUMO battery-model vType parameters (``Energy/unknown`` model); defaults are SUMO's documented Kia defaults.
+    energy_params: dict[str, float] = Field(default_factory=dict)
+
+
+class FleetArchetypeSpec(_Model):
+    """Heterogeneous V2X fleet sub-class (domestic V2H, kerbside, commercial depot, utility V2L, ride-hail)."""
+
+    id: str
+    role: Literal["domestic_v2h", "kerbside_public", "commercial_depot", "utility_v2l", "ride_hail"] = "domestic_v2h"
+    n_vehicles: int = 2
+    id_prefix: str | None = None
+    home_zone: str | None = None
+    capacity_kwh: float = 60.0
+    max_power_kw: float = 7.4
+    initial_soc: float = 0.75
+    person_capacity: int = 4
+    chemistry: Literal["NMC811", "LFP"] = "NMC811"
+    minimum_soc: float = 0.20
+    target_soc: float = 0.80
+    maximum_soc: float = 0.95
+    transfer_mode: Literal["AC_single_phase", "AC_three_phase", "DC"] = "AC_single_phase"
     energy_params: dict[str, float] = Field(default_factory=dict)
 
 
@@ -126,6 +154,23 @@ class CityLearnSpec(_Model):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
+class OutageWindow(_Model):
+    """Scheduled grid import limit or islanded outage (`max_import_kw=0`) on a zone (`'*'` = all zones)."""
+
+    zone: str = "*"
+    start_s: float = 0.0
+    end_s: float = 3600.0
+    max_import_kw: float = 0.0
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> OutageWindow:
+        if self.end_s <= self.start_s:
+            raise ValueError("outage end_s must be > start_s")
+        if self.max_import_kw < 0:
+            raise ValueError("max_import_kw must be >= 0")
+        return self
+
+
 class EnergySpec(_Model):
     backend: Literal["reference", "citylearn"] = "reference"
     carbon_kg_per_kwh: float = 0.25
@@ -136,6 +181,8 @@ class EnergySpec(_Model):
     timing_owner: Literal["auto", "mecosim", "energy_model"] = "auto"
     #: ``"energy_model"`` (default, stock SUMO) or ``"sumo_native"`` (optional fast path, SUMO with native V2G).
     transfer: Literal["energy_model", "sumo_native"] = "energy_model"
+    #: Scheduled feeder limits / grid outages (`max_import_kw=0` islands the zone microgrid).
+    outages: list[OutageWindow] = Field(default_factory=list)
 
 
 class SessionSpec(_Model):
@@ -153,6 +200,22 @@ class SessionSpec(_Model):
         return replace(base, **self.overrides)  # type: ignore[arg-type]
 
 
+class UKV2XSpec(_Model):
+    """UKRI Competition 2613 multiparty standards, ENA G99/G100 feeder, SOH & UK market layer."""
+
+    enabled: bool = False
+    season: Literal["winter_peak", "summer_solar", "autumn_wind", "storm_outage"] = "winter_peak"
+    enforce_protocols: bool = True
+    transformer_rating_kva: float = 250.0
+    g100_import_limit_kw: float | None = None
+    g100_export_limit_kw: float | None = None
+    dso_product: Literal["Sustain", "Secure", "Dynamic", "Restore"] = "Secure"
+    dso_contracted_flex_kw: float = 25.0
+    driver_urgent_boost_prob: float = Field(default=0.0, ge=0.0, le=1.0)
+    comms_availability: float = Field(default=1.0, ge=0.0, le=1.0)
+    projected_uk_bev_parc_2030: int = 9_500_000
+
+
 class ScenarioSpec(_Model):
     """Full scenario."""
 
@@ -163,10 +226,12 @@ class ScenarioSpec(_Model):
     zones: list[ZoneSpec]
     hubs: list[HubSpec]
     fleet: FleetSpec = Field(default_factory=FleetSpec)
+    fleet_archetypes: list[FleetArchetypeSpec] = Field(default_factory=list)
     demand: DemandSpec = Field(default_factory=DemandSpec)
     energy: EnergySpec = Field(default_factory=EnergySpec)
     session: SessionSpec = Field(default_factory=SessionSpec)
     reserve: dict[str, float] = Field(default_factory=dict)
+    uk_v2x: UKV2XSpec = Field(default_factory=UKV2XSpec)
 
     @model_validator(mode="after")
     def _check(self) -> ScenarioSpec:
@@ -178,6 +243,12 @@ class ScenarioSpec(_Model):
                 raise ValueError(f"hub {hub.id} refers to unknown zone {hub.zone}")
         if len({h.id for h in self.hubs}) != len(self.hubs):
             raise ValueError("hub ids must be unique")
+        for ow in self.energy.outages:
+            if ow.zone != "*" and ow.zone not in zone_ids:
+                raise ValueError(f"outage window refers to unknown zone {ow.zone!r}")
+        for arch in self.fleet_archetypes:
+            if arch.home_zone is not None and arch.home_zone not in zone_ids:
+                raise ValueError(f"fleet archetype {arch.id!r} refers to unknown home_zone {arch.home_zone!r}")
         return self
 
     def reserve_parameters(self) -> ReserveParameters:

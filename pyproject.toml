@@ -28,17 +28,19 @@ dependencies = [
     "sumolib>=1.24",
     "traci>=1.24",
     "libsumo>=1.24",
+    "v2x-interop @ git+https://github.com/M-Colley/v2x-interop@main",
 ]
 
 [project.optional-dependencies]
 # CityLearn with the external-mobility hook. Until it is released, CI installs it from git (see .github/workflows/ci.yml).
-citylearn = ["citylearn"]
+citylearn = ["citylearn", "pyarrow>=15"]
 rl = ["gymnasium>=1.0", "pettingzoo>=1.24"]
 mosaik = ["mosaik-api-v3>=3.0"]
 analysis = ["pymoo>=0.6.1", "matplotlib>=3.7"]
 dev = [
     "pytest>=8",
     "ruff>=0.6",
+    "pyarrow>=15",
     "gymnasium>=1.0",
     "pettingzoo>=1.24",
     "mosaik-api-v3>=3.0",
@@ -52,6 +54,10 @@ mecosim = "mecosim.cli:main"
 [project.urls]
 Homepage = "https://github.com/M-Colley/mobility-energy-cosim"
 Issues = "https://github.com/M-Colley/mobility-energy-cosim/issues"
+
+[tool.hatch.metadata]
+# v2x-interop is installed from git until it is published on PyPI.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["mecosim"]

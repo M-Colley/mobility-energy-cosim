@@ -218,12 +218,21 @@ def analyze(
             frames["epsilon"] = eps
         if plot:
             plot_pareto(summary, front, cfg_objectives, out / "pareto.png")
+            from mecosim.viz.pareto_html import render_pareto_html
+
+            render_pareto_html(summary, out / "pareto.html", front=front, objectives=cfg_objectives)
     return frames
 
 
 # Reference categorical palette (dataviz skill, light mode): slots 1-3 for the delivery families, neutral gray for
 # baselines; marker shape is a second encoding so identity never relies on colour alone.
-_COLORS = {"greedy_deficit": "#2a78d6", "opportunistic_mid_journey": "#eb6834", "optimized": "#1baf7a"}
+_COLORS = {
+    "greedy_deficit": "#2a78d6",
+    "opportunistic_mid_journey": "#eb6834",
+    "optimized": "#1baf7a",
+    "joint_optimized": "#7b4fd4",
+    "rl": "#c93b6b",
+}
 _NEUTRAL = "#8a8985"
 _MARKERS = {
     "no_delivery": "s",
@@ -233,6 +242,8 @@ _MARKERS = {
     "optimized": "D",
     "optimized_weighted": "D",
     "optimized_epsilon": "P",
+    "joint_optimized": "*",
+    "rl": "v",
 }
 
 

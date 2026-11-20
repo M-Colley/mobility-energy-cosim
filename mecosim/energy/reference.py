@@ -1,15 +1,16 @@
 """Reference energy model: a small, transparent implementation of the :class:`EnergyBackend` contract.
 
-It exists for tests, quick experiments and users without CityLearn. Results in the README come from CityLearn
-(:mod:`mecosim.adapters.citylearn`). Per zone it takes load and PV profiles (kW, one value per master step), applies
-charger energy with a constant efficiency, the charger rating, the partial connection time and the session's discharge
-floor, and reports grid import/export, peak, emissions, PV self-consumption and the zone deficit served.
+It exists for tests, quick experiments and users without CityLearn. Per zone it takes load and PV profiles (kW, one
+value per master step) plus optional feeder import caps / outage windows (``max_import_kw = 0`` for an islanded
+blackout), applies charger energy with constant efficiency, charger rating, partial connection time and the session's
+discharge floor / charge ceiling, and reports grid import/export, peak, emissions, PV self-consumption, zone deficit
+served and unserved energy / outage relief.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,7 +20,34 @@ from numpy.typing import ArrayLike, NDArray
 from mecosim.core.protocols import ChargerTarget, ZoneState
 from mecosim.core.session import battery_energy
 
-__all__ = ["ZoneProfile", "ChargerSpec", "EVSpec", "ReferenceEnergyModel", "synthetic_zone_profile"]
+__all__ = [
+    "ZoneProfile",
+    "ChargerSpec",
+    "EVSpec",
+    "ReferenceEnergyModel",
+    "synthetic_zone_profile",
+    "zone_import_caps_kw",
+]
+
+
+def zone_import_caps_kw(
+    outages: Sequence[Any],
+    zone_ids: Sequence[str],
+    n_steps: int,
+    step_s: float,
+    begin_s: float = 0.0,
+) -> dict[str, NDArray[np.float64]]:
+    """Build per-zone, per-step ``max_import_kw`` arrays (``inf`` outside outage windows)."""
+    caps = {z: np.full(max(1, n_steps), np.inf, dtype=float) for z in zone_ids}
+    for ow in outages:
+        targets = zone_ids if ow.zone == "*" else ([ow.zone] if ow.zone in caps else [])
+        for k in range(max(1, n_steps)):
+            t0 = begin_s + k * step_s
+            t1 = t0 + step_s
+            if t1 > ow.start_s + 1e-9 and t0 < ow.end_s - 1e-9:
+                for z in targets:
+                    caps[z][k] = min(caps[z][k], float(ow.max_import_kw))
+    return caps
 
 
 @dataclass
@@ -30,11 +58,12 @@ class ZoneProfile:
     pv_kw: NDArray[np.float64]
     carbon_kg_per_kwh: NDArray[np.float64] | float = 0.0
     price_per_kwh: NDArray[np.float64] | float = 0.0
+    max_import_kw: NDArray[np.float64] | float = math.inf
 
     def at(self, arr: NDArray[np.float64] | float, step: int) -> float:
         if isinstance(arr, (int, float)):
             return float(arr)
-        return float(arr[min(step, len(arr) - 1)])
+        return float(arr[min(max(step, 0), len(arr) - 1)])
 
 
 @dataclass(frozen=True)
@@ -76,6 +105,8 @@ class _Totals:
     ev_discharged_kwh: float = 0.0
     deficit_kwh_baseline: float = 0.0
     deficit_served_kwh: float = 0.0
+    unserved_kwh_baseline: float = 0.0
+    unserved_kwh: float = 0.0
     battery_throughput_kwh: float = 0.0
     per_zone_import_kwh: dict[str, float] = field(default_factory=dict)
 
@@ -89,33 +120,21 @@ def synthetic_zone_profile(
     load_kw_mean: float = 40.0,
     carbon_kg_per_kwh: float = 0.25,
     price_per_kwh: float = 0.30,
+    max_import_kw: NDArray[np.float64] | float = math.inf,
     seed: int = 0,
 ) -> ZoneProfile:
-    """SYNTHETIC profiles (clearly labelled; for tests and examples without CityLearn data).
-
-    PV: clear-sky half-sine between 06:00 and 18:00 scaled to ``pv_kwp``. Load: mean ``load_kw_mean`` with a morning
-    and an evening bump and 5 % Gaussian noise (seeded).
-    """
+    """SYNTHETIC profiles (clearly labelled; for tests and examples without CityLearn data)."""
     rng = np.random.default_rng(seed)
     hours = start_hour + np.arange(n_steps) * step_s / 3600.0 + step_s / 7200.0
     hod = np.mod(hours, 24.0)
     pv = pv_kwp * np.clip(np.sin(np.pi * (hod - 6.0) / 12.0), 0.0, None)
     shape = 0.85 + 0.25 * np.exp(-((hod - 8.5) ** 2) / 2.0) + 0.35 * np.exp(-((hod - 19.0) ** 2) / 3.0)
     load = load_kw_mean * shape * (1.0 + 0.05 * rng.standard_normal(n_steps))
-    return ZoneProfile(np.clip(load, 0.0, None), pv, carbon_kg_per_kwh, price_per_kwh)
+    return ZoneProfile(np.clip(load, 0.0, None), pv, carbon_kg_per_kwh, price_per_kwh, max_import_kw)
 
 
 class ReferenceEnergyModel:
-    """Energy backend and driver in one object.
-
-    Args:
-        zones: Zone profiles by zone id.
-        chargers: Charger specs by charger id.
-        evs: Electric vehicles by energy-model id.
-        step_seconds: Master step length.
-        n_steps: Episode length in master steps.
-        deficit_zones: Zones whose deficit counts for "deficit served" (default: all).
-    """
+    """Energy backend and driver in one object."""
 
     def __init__(
         self,
@@ -170,13 +189,10 @@ class ReferenceEnergyModel:
         connected_since_seconds: float | None = None,
         departure_seconds: float | None = None,
     ) -> None:
-        # connected_since_seconds and departure_seconds are accepted for API compatibility; the reference model applies
-        # the orchestrator's per-interval energy targets, which already contain the session timing.
         if charger_id not in self._conn or ev_id not in self.evs:
             raise KeyError(f"unknown charger {charger_id!r} or EV {ev_id!r}")
         if connected_seconds is not None and not 0 <= connected_seconds <= self._step_seconds + 1e-9:
             raise ValueError("connected_seconds must be within [0, step_seconds]")
-        # Same validation rules as CityLearn's env.mobility (citylearn_api.md section 4).
         cur = self._conn[charger_id]
         if cur.state in (1, 2) and cur.ev_id != ev_id:
             raise ValueError(f"charger {charger_id} is occupied by {cur.ev_id}; call away() first")
@@ -226,11 +242,16 @@ class ReferenceEnergyModel:
         prof = self.zones[zone_id]
         h = self._step_seconds / 3600.0
         deficits, surpluses = [], []
+        any_outage = False
         for k in range(step, step + max(1, horizon)):
             net = prof.at(prof.load_kw, k) - prof.at(prof.pv_kw, k)
             deficits.append(max(0.0, net) * h)
             surpluses.append(max(0.0, -net) * h)
+            cap_k = prof.at(prof.max_import_kw, k)
+            if cap_k <= 1e-9 or (math.isfinite(cap_k) and max(0.0, net) > cap_k + 1e-9):
+                any_outage = True
         net0 = prof.at(prof.load_kw, step) - prof.at(prof.pv_kw, step)
+        cap0 = prof.at(prof.max_import_kw, step)
         return ZoneState(
             id=zone_id,
             deficit_kw=max(0.0, net0),
@@ -239,6 +260,8 @@ class ReferenceEnergyModel:
             surplus_forecast_kwh=tuple(surpluses),
             carbon_intensity_kg_per_kwh=prof.at(prof.carbon_kg_per_kwh, step),
             price_per_kwh=prof.at(prof.price_per_kwh, step),
+            outage=bool(cap0 <= 1e-9 or any_outage),
+            max_import_kw=cap0,
         )
 
     # ----------------------------------------------------------------------------------------- driver API
@@ -275,12 +298,11 @@ class ReferenceEnergyModel:
             batt = min(batt, max(0.0, ceil - ev.soc) * ev.capacity_kwh)
             return batt / spec.charge_efficiency
         floor = 0.0 if conn.floor is None else conn.floor
-        batt = battery_energy(e, spec.discharge_efficiency)  # negative
+        batt = battery_energy(e, spec.discharge_efficiency)
         batt = max(batt, -max(0.0, ev.soc - floor) * ev.capacity_kwh)
         return batt * spec.discharge_efficiency
 
     def _charger_energy(self, cid: str, target: ChargerTarget | None) -> float:
-        """Terminal energy of charger ``cid`` in this interval after rating, connection time, SOC limits."""
         e = self.preview_charger_energy(cid, target)
         conn = self._conn[cid]
         if conn.state != 1 or conn.ev_id is None or target is None:
@@ -309,29 +331,39 @@ class ReferenceEnergyModel:
         for zid, prof in self.zones.items():
             load = prof.at(prof.load_kw, t) * h
             pv = prof.at(prof.pv_kw, t) * h
+            cap_kw = prof.at(prof.max_import_kw, t)
+            cap_kwh = cap_kw * h if math.isfinite(cap_kw) else math.inf
             base_net = load - pv
             net = base_net + ev_zone[zid]
-            imp, exp = max(0.0, net), max(0.0, -net)
+            raw_imp = max(0.0, net)
+            imp = min(raw_imp, cap_kwh)
+            unserved = max(0.0, raw_imp - cap_kwh)
+            base_unserved = max(0.0, max(0.0, base_net) - cap_kwh)
+            # Islanded microgrid (cap_kw == 0) curtails excess rather than exporting to a failed feeder.
+            exp = 0.0 if cap_kw <= 1e-9 else max(0.0, -net)
             carbon = prof.at(prof.carbon_kg_per_kwh, t)
             price = prof.at(prof.price_per_kwh, t)
             self.totals.import_kwh += imp
             self.totals.export_kwh += exp
+            self.totals.unserved_kwh += unserved
+            self.totals.unserved_kwh_baseline += base_unserved
             self.totals.per_zone_import_kwh[zid] = self.totals.per_zone_import_kwh.get(zid, 0.0) + imp
             self.totals.emissions_kg += imp * carbon
             self.totals.cost += imp * price
             self.totals.pv_kwh += pv
-            self.totals.pv_used_kwh += float(np.clip(pv - exp, 0.0, pv))
+            used_pv = pv if cap_kw <= 1e-9 and net >= 0 else float(np.clip(pv - max(0.0, -net), 0.0, pv))
+            self.totals.pv_used_kwh += used_pv
             if zid in self.deficit_zones:
                 self.totals.deficit_kwh_baseline += max(0.0, base_net)
                 self.totals.deficit_served_kwh += min(max(0.0, base_net), max(0.0, -ev_zone[zid]))
             row[f"{zid}_import_kwh"] = imp
+            row[f"{zid}_unserved_kwh"] = unserved
             row[f"{zid}_ev_kwh"] = ev_zone[zid]
             row[f"{zid}_base_net_kwh"] = base_net
         total_import_kw = sum(row[f"{z}_import_kwh"] for z in self.zones) / h
         self.totals.peak_import_kw = max(self.totals.peak_import_kw, total_import_kw)
         self.history.append(row)
         self._t = t + 1
-        # Carry connections into the next step (they persist until away() or another write, as in CityLearn).
         self._carried = set()
         for cid, c in self._conn.items():
             if c.state == 1:
@@ -363,6 +395,9 @@ class ReferenceEnergyModel:
             "ev_discharged_kwh": tot.ev_discharged_kwh,
             "zone_deficit_kwh": tot.deficit_kwh_baseline,
             "zone_deficit_served_kwh": tot.deficit_served_kwh,
+            "unserved_baseline_kwh": tot.unserved_kwh_baseline,
+            "unserved_energy_kwh": tot.unserved_kwh,
+            "outage_relief_kwh": max(0.0, tot.unserved_kwh_baseline - tot.unserved_kwh),
             "equivalent_full_cycles": tot.battery_throughput_kwh / (2.0 * cap) if cap > 0 else 0.0,
             **{f"import_kwh_{z}": v for z, v in tot.per_zone_import_kwh.items()},
         }
