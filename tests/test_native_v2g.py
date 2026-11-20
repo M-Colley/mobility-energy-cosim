@@ -69,6 +69,32 @@ def test_native_fast_path_delivers_exact_energy(tmp_path: Path) -> None:
     assert -sess.measured_terminal_kwh == pytest.approx(0.5, rel=1e-3)  # energy model received the same energy
 
 
+@pytest.mark.skipif(not os.environ.get("MECOSIM_SUMO_NATIVE_BINARY"), reason="no native V2G SUMO build configured")
+def test_native_session_ramps_detected_and_configured(tmp_path: Path) -> None:
+    built = tiny_built(
+        tmp_path, **{"demand.ride_period_s": 5000, "simulation.duration_s": 600, "energy.transfer": "sumo_native"}
+    )
+    orch = make_orchestrator(
+        built,
+        _script(0.3),
+        output_dir=tmp_path / "sumo",
+        sumo_backend="traci",
+        sumo_binary=os.environ["MECOSIM_SUMO_NATIVE_BINARY"],
+    )
+    energy = reference_backend(built)
+    station_id = built.hubs["he"].station_id
+    try:
+        orch.run(energy)
+        assert orch.mobility.native_session_ramps_available() is True
+        cs = orch.mobility.api.chargingstation
+        assert float(cs.getParameter(station_id, "chargeRampUp")) == pytest.approx(3350.0)
+        assert float(cs.getParameter(station_id, "chargeRampDown")) == pytest.approx(3310.0)
+        assert float(cs.getParameter(station_id, "chargeStopDelay")) == pytest.approx(22.0)
+        assert float(cs.getParameter(station_id, "actualPower")) == pytest.approx(0.0)
+    finally:
+        orch.close()
+
+
 @pytest.mark.skipif(not os.environ.get("MECOSIM_SUMO_TAXI_BINARY"), reason="no SUMO build with taxi charging stops")
 def test_native_taxi_charging_stops_keep_post_dropoff_stop(tmp_path: Path) -> None:
     """With SUMO's native taxi charging stops (sumo_api.md section 7), a post-drop-off energy stop is inserted right

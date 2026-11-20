@@ -32,7 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # CityLearn with the external-mobility hook. Until it is released, CI installs it from git (see .github/workflows/ci.yml).
-citylearn = ["citylearn"]
+citylearn = ["citylearn", "pyarrow>=15"]
 rl = ["gymnasium>=1.0", "pettingzoo>=1.24"]
 mosaik = ["mosaik-api-v3>=3.0"]
 analysis = ["pymoo>=0.6.1", "matplotlib>=3.7"]

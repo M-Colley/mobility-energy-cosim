@@ -20,13 +20,20 @@ from mecosim.core.entities import EnergySession
 from mecosim.core.events import EventLog
 from mecosim.core.orchestrator import Orchestrator, OrchestratorConfig
 from mecosim.core.protocols import EnergyDriver, Policy
-from mecosim.energy.reference import ChargerSpec, EVSpec, ReferenceEnergyModel, synthetic_zone_profile
+from mecosim.energy.reference import (
+    ChargerSpec,
+    EVSpec,
+    ReferenceEnergyModel,
+    synthetic_zone_profile,
+    zone_import_caps_kw,
+)
 from mecosim.metrics.mobility import mobility_metrics
 from mecosim.metrics.pareto import welfare
 from mecosim.paths import absolute
 from mecosim.policies import make_policy
 from mecosim.scenarios.build import BuiltScenario, build_scenario
 from mecosim.scenarios.spec import ScenarioSpec
+from mecosim.viz.replay import build_replay_bundle, extract_network_geometry, render_replay_html
 
 __all__ = ["RunResult", "reference_backend", "make_orchestrator", "run_scenario", "resolve_timing_owner"]
 
@@ -59,6 +66,7 @@ class RunResult:
     sessions: list[EnergySession]
     output_dir: Path
     params: dict[str, Any] = field(default_factory=dict)
+    frames: list[dict[str, Any]] = field(default_factory=list)
 
     def sessions_frame(self) -> pd.DataFrame:
         rows = []
@@ -77,6 +85,13 @@ def reference_backend(built: BuiltScenario) -> ReferenceEnergyModel:
     """Reference energy model with SYNTHETIC zone profiles from the scenario's zone specs."""
     spec = built.spec
     sim = spec.simulation
+    caps = (
+        zone_import_caps_kw(
+            spec.energy.outages, [z.id for z in spec.zones], sim.n_steps + 2, sim.master_step_s, sim.begin_s
+        )
+        if spec.energy.outages
+        else {}
+    )
     zones = {
         z.id: synthetic_zone_profile(
             sim.n_steps + 1,
@@ -86,6 +101,7 @@ def reference_backend(built: BuiltScenario) -> ReferenceEnergyModel:
             load_kw_mean=z.load_kw_mean,
             carbon_kg_per_kwh=spec.energy.carbon_kg_per_kwh,
             price_per_kwh=spec.energy.price_per_kwh,
+            max_import_kw=caps.get(z.id, math.inf),
             seed=spec.seed + i,
         )
         for i, z in enumerate(spec.zones)
@@ -167,6 +183,7 @@ def run_scenario(
     welfare_weights: Mapping[str, float] | None = None,
     driver: EnergyDriver | None = None,
     write: bool = True,
+    replay_html: bool = False,
 ) -> RunResult:
     """Build (if needed) and run one scenario with one policy; write metrics, sessions and events to ``out_dir``."""
     out = absolute(out_dir)
@@ -211,20 +228,35 @@ def run_scenario(
     metrics["welfare"] = welfare(metrics, welfare_weights)
     metrics["wall_time_s"] = wall
     metrics["teleports"] = float(getattr(orch.mobility, "teleports", math.nan))
+    policy_name = str(getattr(policy, "name", type(policy).__name__))
     result = RunResult(
         metrics,
         orch.log,
         list(orch.sessions.values()),
         out,
         {
-            "policy": getattr(policy, "name", type(policy).__name__),
+            "policy": policy_name,
             "timing_owner": orch.config.timing_owner,
             **dict(policy_params or {}),
         },
+        list(orch.frames),
     )
     if write:
         with open(out / "metrics.json", "w", encoding="utf-8") as fh:
             json.dump({"params": result.params, "metrics": metrics}, fh, indent=2, default=float)
         result.sessions_frame().to_csv(out / "sessions.csv", index=False)
         orch.log.write_jsonl(out / "events.jsonl")
+        net_geom = extract_network_geometry(built.net_file, built.zone_of_edge, built.hubs)
+        bundle = build_replay_bundle(
+            scenario_name=built.spec.name,
+            policy_name=policy_name,
+            zones={z.id: z.role for z in built.zones.values()},
+            network=net_geom,
+            frames=result.frames,
+            sessions=result.sessions,
+            metrics=metrics,
+        )
+        (out / "replay.json").write_text(json.dumps(bundle), encoding="utf-8")
+        if replay_html:
+            render_replay_html(bundle, out / "replay.html")
     return result

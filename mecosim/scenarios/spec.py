@@ -21,6 +21,7 @@ __all__ = [
     "DemandSpec",
     "SimulationSpec",
     "CityLearnSpec",
+    "OutageWindow",
     "EnergySpec",
     "SessionSpec",
     "ScenarioSpec",
@@ -126,6 +127,23 @@ class CityLearnSpec(_Model):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
+class OutageWindow(_Model):
+    """Scheduled grid import limit or islanded outage (`max_import_kw=0`) on a zone (`'*'` = all zones)."""
+
+    zone: str = "*"
+    start_s: float = 0.0
+    end_s: float = 3600.0
+    max_import_kw: float = 0.0
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> OutageWindow:
+        if self.end_s <= self.start_s:
+            raise ValueError("outage end_s must be > start_s")
+        if self.max_import_kw < 0:
+            raise ValueError("max_import_kw must be >= 0")
+        return self
+
+
 class EnergySpec(_Model):
     backend: Literal["reference", "citylearn"] = "reference"
     carbon_kg_per_kwh: float = 0.25
@@ -136,6 +154,8 @@ class EnergySpec(_Model):
     timing_owner: Literal["auto", "mecosim", "energy_model"] = "auto"
     #: ``"energy_model"`` (default, stock SUMO) or ``"sumo_native"`` (optional fast path, SUMO with native V2G).
     transfer: Literal["energy_model", "sumo_native"] = "energy_model"
+    #: Scheduled feeder limits / grid outages (`max_import_kw=0` islands the zone microgrid).
+    outages: list[OutageWindow] = Field(default_factory=list)
 
 
 class SessionSpec(_Model):
@@ -178,6 +198,9 @@ class ScenarioSpec(_Model):
                 raise ValueError(f"hub {hub.id} refers to unknown zone {hub.zone}")
         if len({h.id for h in self.hubs}) != len(self.hubs):
             raise ValueError("hub ids must be unique")
+        for ow in self.energy.outages:
+            if ow.zone != "*" and ow.zone not in zone_ids:
+                raise ValueError(f"outage window refers to unknown zone {ow.zone!r}")
         return self
 
     def reserve_parameters(self) -> ReserveParameters:

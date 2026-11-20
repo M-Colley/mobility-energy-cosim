@@ -122,6 +122,8 @@ class ZoneState:
     surplus_forecast_kwh: tuple[float, ...] = ()
     carbon_intensity_kg_per_kwh: float = 0.0
     price_per_kwh: float = 0.0
+    outage: bool = False
+    max_import_kw: float = float("inf")
 
 
 @dataclass

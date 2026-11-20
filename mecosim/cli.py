@@ -1,4 +1,4 @@
-"""Command-line interface: ``mecosim run``, ``mecosim sweep``, ``mecosim build``, ``mecosim info``."""
+"""Command-line interface: ``run``, ``sweep``, ``build``, ``train-rl``, ``replay``, ``pareto-html``, ``info``."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import yaml
 from mecosim import __version__
 from mecosim.paths import absolute
 
-__all__ = ["main"]
+__all__ = ["main", "build_parser"]
 
 
 def _parse_params(items: list[str]) -> dict[str, object]:
@@ -36,21 +36,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
     spec = ScenarioSpec.from_yaml(args.scenario)
     if args.set:
         spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
-    res = run_scenario(spec, args.policy, _parse_params(args.param or []), out_dir=args.out, sumo_backend=args.backend)
+    res = run_scenario(
+        spec,
+        args.policy,
+        _parse_params(args.param or []),
+        out_dir=args.out,
+        sumo_backend=args.backend,
+        replay_html=bool(args.replay_html),
+    )
     keys = [
         "grid_import_kwh",
         "emissions_kg",
         "peak_import_kw",
         "zone_deficit_served_kwh",
+        "unserved_energy_kwh",
+        "outage_relief_kwh",
         "delivered_kwh_measured",
         "throughput_trips_per_h",
         "mean_person_wait_s",
         "passenger_delay_per_trip_s",
         "background_mean_time_loss_s",
         "energy_delivery_vkm",
+        "fleet_energy_change_kwh",
         "welfare",
     ]
-    print(json.dumps({k: res.metrics.get(k) for k in keys}, indent=2))
+    print(json.dumps({k: res.metrics.get(k) for k in keys if k in res.metrics}, indent=2))
     print(f"outputs: {res.output_dir}")
     return 0
 
@@ -82,7 +92,7 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
         cols = ["label", "policy"] + [c for c in summary.columns if c.startswith("param.")] + list(cfg.objectives)
         cols = [c for c in cols if c in summary.columns]
         print(summary[cols].to_string(index=False))
-    if "pareto" in frames:
+    if "pareto" in frames and summary is not None:
         print(f"\nPareto set: {len(frames['pareto'])} of {len(summary)} configurations")
     print(f"outputs: {absolute(args.out)}")
     return 0
@@ -96,6 +106,61 @@ def _cmd_build(args: argparse.Namespace) -> int:
     print(f"sumocfg: {built.sumocfg}")
     for hub in built.hubs.values():
         print(f"hub {hub.id}: zone={hub.zone} edge={hub.edge_id} station={hub.station_id} plugs={hub.plugs}")
+    return 0
+
+
+def _cmd_train_rl(args: argparse.Namespace) -> int:
+    from mecosim.policies.rl import PPOConfig, train_rl_policy
+    from mecosim.scenarios.spec import ScenarioSpec
+
+    spec = ScenarioSpec.from_yaml(args.scenario)
+    if args.set:
+        spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
+    cfg = PPOConfig(
+        bc_episodes=args.bc_episodes,
+        bc_epochs=args.bc_epochs,
+        ppo_episodes=args.ppo_episodes,
+        ppo_epochs=args.ppo_epochs,
+        seed=args.seed,
+    )
+    _, hist = train_rl_policy(
+        spec,
+        out_checkpoint=args.out,
+        config=cfg,
+        work_dir=args.work_dir,
+        sumo_backend=args.backend,
+    )
+    print(
+        json.dumps(
+            {
+                "checkpoint": str(absolute(args.out)),
+                "bc_loss_final": hist.bc_losses[-1] if hist.bc_losses else None,
+                "ppo_returns": hist.episode_returns,
+                "eval_welfare": hist.episode_welfare[-1] if hist.episode_welfare else None,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    from mecosim.viz.replay import render_replay_html
+
+    src = Path(args.source)
+    out = Path(args.out) if args.out else (src / "replay.html" if src.is_dir() else src.with_suffix(".html"))
+    written = render_replay_html(src, out)
+    print(f"replay html: {absolute(written)}")
+    return 0
+
+
+def _cmd_pareto_html(args: argparse.Namespace) -> int:
+    from mecosim.viz.pareto_html import render_pareto_html
+
+    src = Path(args.sweep_dir)
+    out = Path(args.out) if args.out else (src / "pareto.html")
+    written = render_pareto_html(src, out)
+    print(f"pareto html: {absolute(written)}")
     return 0
 
 
@@ -147,6 +212,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--set", action="append", help="scenario override key=value, e.g. fleet.n_vehicles=8")
     r.add_argument("--out", default="output/run")
     r.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
+    r.add_argument("--replay-html", action="store_true", help="also write interactive replay.html")
     r.set_defaults(func=_cmd_run)
 
     s = sub.add_parser("sweep", help="policy x parameter sweep with Pareto analysis")
@@ -165,6 +231,29 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("scenario")
     b.add_argument("--out", default="output/scenario")
     b.set_defaults(func=_cmd_build)
+
+    trl = sub.add_parser("train-rl", help="train RLDeliveryPolicy via BC warm-start + PPO")
+    trl.add_argument("scenario", help="scenario YAML")
+    trl.add_argument("--out", default="output/rl_policy.json", help="output JSON weights file")
+    trl.add_argument("--work-dir", default="output/train_rl", help="rollout working directory")
+    trl.add_argument("--bc-episodes", type=int, default=2)
+    trl.add_argument("--bc-epochs", type=int, default=25)
+    trl.add_argument("--ppo-episodes", type=int, default=4)
+    trl.add_argument("--ppo-epochs", type=int, default=4)
+    trl.add_argument("--seed", type=int, default=0)
+    trl.add_argument("--set", action="append", help="scenario override key=value")
+    trl.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
+    trl.set_defaults(func=_cmd_train_rl)
+
+    rep = sub.add_parser("replay", help="generate interactive HTML5 replay from a run directory or replay.json")
+    rep.add_argument("source", help="run directory or replay.json path")
+    rep.add_argument("--out", help="output HTML path (default: <source>/replay.html)")
+    rep.set_defaults(func=_cmd_replay)
+
+    ph = sub.add_parser("pareto-html", help="generate interactive HTML5 Pareto & welfare explorer from a sweep folder")
+    ph.add_argument("sweep_dir", help="sweep output directory containing summary.csv")
+    ph.add_argument("--out", help="output HTML path (default: <sweep_dir>/pareto.html)")
+    ph.set_defaults(func=_cmd_pareto_html)
 
     i = sub.add_parser("info", help="versions and available policies")
     i.set_defaults(func=_cmd_info)

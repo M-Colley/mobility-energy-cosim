@@ -145,9 +145,13 @@ Mid-journey discharge must leave a trip reserve (`mecosim.core.reserve`):
 
 - Route lengths come from SUMO's router on current travel times (`simulation.findRoute`): from the hub to the passenger
   destination, and from there (or from the hub without passengers) to the nearest hub in a charging (PV-rich) zone.
-- Consumption estimate: `max(prior, measured) × uncertainty factor`, with the measured value = SUMO's
+- Consumption estimate: `max(prior, measured) × uncertainty factor` by default, with the measured value = SUMO's
   `totalEnergyConsumed − totalEnergyRegenerated` over the odometer, trusted after 1 km. The prior 0.20 kWh/km, the
-  factor 1.2 and the margin 0.05 are **assumed** defaults (configurable in the scenario's `reserve` section).
+  factor 1.2 and the margin 0.05 are **assumed** defaults (configurable in the scenario's `reserve` section). When
+  adaptive reserve parameters are enabled (`adaptive_ucb_z > 0` or `edge_prior_km > 0`, or via
+  `AdaptiveConsumptionEstimator`), distance-weighted Welford statistics track empirical consumption mean and variance
+  online per vehicle and per road edge, integrating `posterior_mean × uncertainty_factor + z × posterior_std` (plus
+  optional quadratic speed sensitivity) edge-by-edge along `route_edges`.
 
 The energy delivered per stop is a decision variable (design section 2.1). An exact delivery of `E` is enforced in the
 energy model through the session's discharge floor:
@@ -184,8 +188,10 @@ model (constant efficiency) the agreement is exact to floating point (`tests/tes
 - Optional fast path (`energy_transfer="sumo_native"`, off by default): for SUMO builds with native discharging
   (detected with `chargingstation.getDischargePower`, TraCI variable 0x9e), SUMO discharges the battery at the station
   down to `minimumChargeLevel` (the floor) and mecosim passes the measured energy × station efficiency to CityLearn
-  instead of the session profile; SUMO's battery is then not corrected. SUMO models phases 2-3 only as `chargeDelay`
-  and has no ramps (rectangular profile), so the default path stays the reference. Not part of released SUMO yet.
+  instead of the session profile; SUMO's battery is then not corrected. When the SUMO build also exposes native session
+  ramps (`actualPower` / `chargeRampUp` / `chargeRampDown` / `chargeStopDelay`), mecosim configures trapezoidal ramps
+  and the decoupling stop delay automatically; otherwise it falls back to `chargeDelay` (rectangular profile). Not part
+  of released SUMO yet.
 
 ### Zone KPIs
 
@@ -199,35 +205,46 @@ distort PV self-consumption. `runner.run_scenario` also reports `driving_energy_
 `total_equivalent_full_cycles` (hub + driving battery throughput) and `fleet_energy_change_kwh` (end minus initial
 fleet battery energy).
 
-### Resampling CityLearn data
+### Resampling CityLearn data & outage windows
 
-CityLearn does not resample (its `docs/data_unit_contract.md`). mecosim writes the episode window resampled to the
-master step: energy columns (`non_shiftable_load`, `dhw_demand`, `cooling_demand`, `heating_demand`, kWh/step) are
-divided by the number of sub-steps; everything else, including the PV profile in CityLearn's default `per_kw` mode
-(inverter power in W/kW, multiplied by the step length inside CityLearn), is held constant within the hour. Hourly
-energy totals are preserved exactly; within-hour variability is not represented.
+CityLearn does not resample (its `docs/data_unit_contract.md`). mecosim supports both CSV and Parquet datasets across
+three step relationships (`mecosim.adapters.citylearn.dataset.resample_window`):
 
-## 5. Optimised delivery (MILP)
+- **Native match** (`src_step == master_step_s`, e.g. 15-minute `pt_rec_*` communities at 900 s): sliced directly.
+- **Sub-stepping** (`src_step == k * master_step_s`): energy columns (`non_shiftable_load`, `dhw_demand`,
+  `cooling_demand`, `heating_demand`, plus `solar_generation` in `generation_mode="absolute"`) are divided by `k`;
+  intensive columns (and `per_kw` PV profiles) are step-held.
+- **Aggregation** (`master_step_s == m * src_step`, e.g. 15 s datasets at 60 s): energy columns are summed and intensive
+  columns averaged over blocks of `m` rows.
+
+Scheduled zone feeder import caps and blackouts (`max_import_kw = 0`) are configured via `energy.outages`, tracking
+`unserved_baseline_kwh`, `unserved_energy_kwh` and `outage_relief_kwh`.
+
+## 5. Optimised delivery, joint passenger+energy MILP, and RL
 
 `OptimizedDelivery` solves, at every decision epoch, a mixed-integer program with `scipy.optimize.milp` (HiGHS):
 
-- decisions: binary `y[v,h,s]` (vehicle `v` stops at hub `h` starting in slot `s`) and continuous `e[v,h,s] ≥ 0` (kWh);
-- `e ≤ e_max·y`, `e ≥ e_min·y`, with `e_max` from the reserve (`(SOC_arrival − floor_reserve) × capacity × η_d`) and
-  the time budget;
-- one stop per vehicle; hub connector capacity per slot (a stop occupies the slots its maximal duration covers, and
-  late-slot candidates are bounded by the remaining horizon `(S − s) L`; future slots release plugs whose active
-  sessions end earlier);
-- zone deficit cap over the horizon (minus the *remaining* undelivered energy of sessions already planned or active
-  there) and a zone power cap per slot (concurrent deliveries ≤ forecast deficit power / charger power, at least one
-  while there is a deficit, minus sessions overlapping that slot), so that deliveries offset local load instead of
-  being exported;
-- time budget `(O + detour)·y + e·3600/P ≤ budget` (idle vehicles: `max_idle_stop_s`; vehicles with passengers: the
-  passengers' maximum acceptable delay);
-- optional ε-constraint: cumulative passenger delay from energy stops ≤ ε × elapsed hours (then the delay weight is 0);
-- objective (maximised), explicit weights (`ObjectiveWeights`): value of the deficit served (price + carbon price ×
-  carbon intensity + optional unserved-energy penalty) − passenger delay × value of time − traffic proxy (seconds of
-  dwell × cost per second; curbside stops count fully, off-street stops with a factor) − battery wear per kWh −
-  replacement cost of the delivered energy − energy of the approach/detour.
+- decisions: binary `y[v,h,s,d]` (vehicle `v` stops at hub `h` starting in slot `s` in direction `d` ∈
+  `{"discharge", "charge"}`) and continuous `e[v,h,s,d] ≥ 0` (kWh);
+- `e ≤ e_max·y`, `e ≥ e_min·y`, with `e_max` from the trip reserve (`(SOC_arrival − floor_reserve) × capacity × η_d`)
+  for discharges, target-SOC headroom (`(target_soc − SOC_arrival) × capacity / η_c`) for co-optimised PV-surplus
+  charges, and the time budget;
+- one stop per vehicle across both directions; shared hub connector capacity per slot;
+- zone deficit cap (discharges) and PV-surplus cap (charges) over the horizon and per slot;
+- optional terminal-SOC shadow price (`terminal_soc_value_per_kwh`) and soft-penalised fleet SOC-neutrality floor
+  (`min_fleet_soc_delta_kwh`, always feasible via slack variable `s_soc ≥ 0`);
+- time budget `(O + detour)·y + e·3600/P ≤ budget` and optional ε-constraint on cumulative passenger delay;
+- objective (maximised), explicit weights (`ObjectiveWeights`): value of deficit served (or battery energy stored from
+  PV surplus) − passenger delay × value of time − traffic proxy − battery wear − replacement/terminal-SOC opportunity
+  cost − approach/detour energy.
+
+`JointOptimizedDispatch` (`joint_optimized`) extends the same HiGHS formulation with binary passenger-matching variables
+`x[r, v]` and ride-coupled energy-stop synergies `(z[r, v, h], q[r, v, h])` (`∑ z ≤ x`), jointly optimising which taxi
+serves which open passenger request alongside immediate, en-route mid-journey and post-dropoff V2B/charging stops.
+
+`RLDeliveryPolicy` (`rl`, trained via `mecosim train-rl`) scores `no_op` and feasible `(hub, direction)` options with a
+size-invariant neural actor-critic, masking infeasible stops and projecting the continuous output onto `[e_min, e_max]`
+so trip-reserve safety holds identically during Behavioral Cloning warm-start, PPO rollouts and evaluation.
 
 Weight defaults: carbon price 0.19 per kg CO2 (US EPA (2023), *Report on the Social Cost of Greenhouse Gases*, central
 estimate USD 190 per tonne for 2020 emissions at a 2 % discount rate); battery wear 0.02 per kWh of battery throughput

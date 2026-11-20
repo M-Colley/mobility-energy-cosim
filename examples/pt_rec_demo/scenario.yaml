@@ -1,0 +1,56 @@
+# Sub-hourly Renewable Energy Community demo using CityLearn's native 15-minute Parquet dataset (pt_rec_15).
+# West aggregates solar prosumer members; east aggregates non-PV residential members.
+name: pt_rec_demo
+seed: 3
+simulation:
+  begin_s: 0
+  duration_s: 7200           # 2 h midday solar window
+  master_step_s: 300         # 5-min master steps (3 sub-steps per native 900 s REC interval; use 900 for 1:1 native)
+  mobility_step_s: 1.0
+  start_hour: 12
+network:
+  kind: grid
+  grid_number: 5
+  grid_length_m: 220
+  lanes: 1
+  speed_mps: 13.89
+zones:
+  - id: west
+    role: pv_rich
+    x_range: [0.0, 0.5]
+    pv_scale: 3.0
+    pv_kwp: 30
+    load_kw_mean: 6
+    buildings: [Member_001, Member_005]
+  - id: east
+    role: pv_poor
+    x_range: [0.5, 1.0]
+    pv_scale: 0.0
+    pv_kwp: 0
+    load_kw_mean: 12
+    buildings: [Member_002, Member_003, Member_004, Member_006]
+hubs:
+  - {id: rec_west_hub, zone: west, plugs: 3, power_kw: 11.0}
+  - {id: rec_east_hub, zone: east, plugs: 3, power_kw: 11.0}
+fleet:
+  n_vehicles: 6
+  capacity_kwh: 60
+  max_power_kw: 11
+  initial_soc: 0.7
+demand:
+  ride_period_s: 120
+  ride_min_distance_m: 500
+  max_passenger_delay_s: 600
+  background_period_s: 6
+energy:
+  backend: citylearn
+  timing_owner: auto
+  citylearn:
+    dataset: pt_rec_15
+    start_time_step: 17328   # summer midday (96 steps/day * 180 + 48 = day 180, 12:00)
+session:
+  preset: robotic_conductive
+reserve:
+  prior_kwh_per_km: 0.20
+  uncertainty_factor: 1.2
+  safety_margin_soc: 0.05

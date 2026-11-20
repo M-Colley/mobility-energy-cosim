@@ -52,6 +52,7 @@ from mecosim.core.protocols import (
 )
 from mecosim.core.reserve import ConsumptionEstimator, ReserveParameters, delivery_floor
 from mecosim.core.session import SessionModel, SessionParameters
+from mecosim.viz.replay import snapshot_observation
 
 __all__ = ["OrchestratorConfig", "ChargerTarget", "Orchestrator"]
 
@@ -146,6 +147,7 @@ class Orchestrator:
         self.seed = seed
         self.policy_options = dict(policy_options or {})
         self.log = EventLog()
+        self.frames: list[dict[str, Any]] = []
         self.backend: EnergyBackend | None = None
         self._mobility_started = False
         self.step = 0
@@ -198,6 +200,7 @@ class Orchestrator:
         self._targets.clear()
         self._connected_last.clear()
         self._soc_ref.clear()
+        self.frames.clear()
         context = PolicyContext(
             clock=self.clock,
             hubs=self.hubs,
@@ -255,10 +258,13 @@ class Orchestrator:
             self._maintain_stops()
             obs = self.observe(t)
             if k == 0:
+                self.frames.append(snapshot_observation(obs))
                 for vid, st in obs.vehicles.items():
                     self._soc_at_step_start[vid] = st.soc
                     if st.in_simulation:
-                        self.consumption.update(vid, st.consumed_kwh, st.odometer_km)
+                        self.consumption.update(
+                            vid, st.consumed_kwh, st.odometer_km, edge_id=st.edge_id, speed_mps=st.speed_mps
+                        )
             commands = self.policy.decide(obs)
             self.apply(commands, obs)
             events = self.mobility.advance(start + (k + 1) * epoch_len)
@@ -345,6 +351,7 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001 - simulator rejected the dispatch
             self.log.add("dispatch_rejected", t, vehicle=cmd.vehicle_id, reason=str(exc))
             return {"ok": False, "reason": str(exc)}
+        self._states.pop(cmd.vehicle_id, None)
         self.log.add("dispatch", t, vehicle=cmd.vehicle_id, reservations=",".join(cmd.reservation_ids))
         if planned is not None and planned.status == SessionStatus.PLANNED:
             # dispatchShared aborts all stops of the taxi: put the pending energy stop back (design section 4.1).
@@ -616,13 +623,17 @@ class Orchestrator:
             schedule(ev.vehicle_id, hub.station_id, ev.time_s + sess.planned_duration_s)
         if self._native_v2g and sess.direction == "discharge" and sess.floor_soc is not None:
             mob: Any = self.mobility
+            prm = self.session_model.params
             mob.native_v2g_begin(
                 ev.vehicle_id,
                 hub.station_id,
                 sess.power_kw,
                 sess.floor_soc,
                 efficiency=eta,
-                delay_s=self.session_model.params.ready_s,
+                delay_s=prm.ready_s,
+                ramp_up_kw_per_s=prm.ramp_up_kw_per_s,
+                ramp_down_kw_per_s=prm.ramp_down_kw_per_s,
+                stop_delay_s=prm.decoupling_s,
             )
             sess.meta["native"] = 1.0
             sess.meta["native_wh0"] = mob.native_total_discharged_wh(ev.vehicle_id)
