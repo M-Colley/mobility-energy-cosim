@@ -55,6 +55,10 @@ mecosim = "mecosim.cli:main"
 Homepage = "https://github.com/M-Colley/mobility-energy-cosim"
 Issues = "https://github.com/M-Colley/mobility-energy-cosim/issues"
 
+[tool.hatch.metadata]
+# v2x-interop is installed from git until it is published on PyPI.
+allow-direct-references = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["mecosim"]
 
