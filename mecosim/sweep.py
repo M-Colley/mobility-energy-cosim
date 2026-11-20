@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import multiprocessing as mp
 import os
 import traceback
 from collections.abc import Mapping
@@ -177,7 +178,8 @@ def run_sweep(
         for job in all_jobs:
             rows.append(_run_job(job, base, str(out), sumo_backend))
     else:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        # Always use 'spawn' so Linux workers never fork an already-initialised libsumo/OpenMP process.
+        with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
             futs = [pool.submit(_run_job, job, base, str(out), sumo_backend) for job in all_jobs]
             for fut in as_completed(futs):
                 rows.append(fut.result())
