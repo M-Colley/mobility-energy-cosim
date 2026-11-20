@@ -209,6 +209,7 @@ class Orchestrator:
             routing=self.mobility,
             seed=self.seed,
             options={"max_passenger_delay_s": self.config.max_passenger_delay_s, **self.policy_options},
+            efficiency_fn=lambda hid, vid, p, d: self.efficiency(hid, 0, vid, p, d),
         )
         self.policy.reset(context)
         self._interval(0)
@@ -218,6 +219,10 @@ class Orchestrator:
         self._reconcile()
         self.step = time_step
         self._interval(time_step)
+
+    def finalize(self, env: Any = None) -> None:
+        """``MobilityProvider.finalize``: reconcile the terminal interval's settled energy."""
+        self._reconcile()
 
     # =========================================================================================== driver loop
     def charger_targets(self) -> dict[str, ChargerTarget]:
@@ -261,6 +266,23 @@ class Orchestrator:
         self._write_connections(t, start, end)
 
     # =========================================================================================== observation
+    def person_delays_s(self) -> dict[str, float]:
+        """Cumulative energy-stop delay (detour + dwell) already planned or incurred per person."""
+        delays: dict[str, float] = {}
+        for s in self.sessions.values():
+            if s.status not in (SessionStatus.PLANNED, SessionStatus.ACTIVE, SessionStatus.DONE):
+                continue
+            pax = s.persons_on_board_at_arrival if s.arrival_s is not None else s.passengers
+            if not pax:
+                continue
+            if s.status == SessionStatus.DONE and s.arrival_s is not None and s.departure_s is not None:
+                dwell = max(0.0, s.departure_s - s.arrival_s)
+            else:
+                dwell = s.planned_duration_s
+            for p in pax:
+                delays[p] = delays.get(p, 0.0) + dwell + s.detour_s
+        return delays
+
     def observe(self, t: int | None = None) -> FleetObservation:
         """Build the policy observation at the current mobility time."""
         t = self.step if t is None else t
@@ -269,9 +291,10 @@ class Orchestrator:
             st = self.mobility.vehicle_state(vid)
             sid = self._vehicle_session.get(vid)
             if sid is not None:
-                st.session_id = sid
                 sess = self.sessions[sid]
-                st.busy_until_s = sess.planned_departure_s
+                if sess.status in (SessionStatus.PLANNED, SessionStatus.ACTIVE):
+                    st.session_id = sid
+                    st.busy_until_s = sess.planned_departure_s
             states[vid] = st
         self._states = states
         backend = self._require_backend()
@@ -288,7 +311,7 @@ class Orchestrator:
         active = {
             sid: s for sid, s in self.sessions.items() if s.status in (SessionStatus.PLANNED, SessionStatus.ACTIVE)
         }
-        return FleetObservation(self.mobility.time_s, t, states, requests, hubs, zones, active)
+        return FleetObservation(self.mobility.time_s, t, states, requests, hubs, zones, active, self.person_delays_s())
 
     # =========================================================================================== commands
     def apply(self, commands: list[Command], obs: FleetObservation | None = None) -> list[dict[str, Any]]:
@@ -310,8 +333,10 @@ class Orchestrator:
         t = self.mobility.time_s
         sid = self._vehicle_session.get(cmd.vehicle_id)
         planned = self.sessions[sid] if sid is not None else None
-        if planned is not None and (
-            planned.status != SessionStatus.PLANNED or not self.config.allow_dispatch_with_planned_stop
+        if (
+            planned is not None
+            and planned.status != SessionStatus.DONE
+            and (planned.status != SessionStatus.PLANNED or not self.config.allow_dispatch_with_planned_stop)
         ):
             self.log.add("dispatch_rejected", t, vehicle=cmd.vehicle_id, reason="in_energy_session")
             return {"ok": False, "reason": "in_energy_session"}
@@ -321,7 +346,7 @@ class Orchestrator:
             self.log.add("dispatch_rejected", t, vehicle=cmd.vehicle_id, reason=str(exc))
             return {"ok": False, "reason": str(exc)}
         self.log.add("dispatch", t, vehicle=cmd.vehicle_id, reservations=",".join(cmd.reservation_ids))
-        if planned is not None:
+        if planned is not None and planned.status == SessionStatus.PLANNED:
             # dispatchShared aborts all stops of the taxi: put the pending energy stop back (design section 4.1).
             self._reinsert(planned, reason="after_dispatch")
         return {"ok": True}
@@ -333,6 +358,13 @@ class Orchestrator:
         )
         t = self.mobility.time_s
         if ok:
+            state = self.mobility.vehicle_state(sess.vehicle_id)
+            if state.in_simulation and state.persons:
+                est = self.estimate(state, sess.hub_id)
+                sess.mid_journey = True
+                sess.passengers = state.persons
+                sess.detour_s = est.detour_s if math.isfinite(est.detour_s) else 0.0
+                sess.detour_km = est.detour_km if math.isfinite(est.detour_km) else 0.0
             self.log.add("energy_stop_reinserted", t, vehicle=sess.vehicle_id, session=sess.id, reason=reason)
         else:
             sess.status = SessionStatus.CANCELLED
@@ -438,8 +470,15 @@ class Orchestrator:
         mid = bool(state.persons) and not after_tasks
         detour_s, detour_km = (est.detour_s, est.detour_km) if mid else (0.0, 0.0)
         t_to_hub = est.travel_s
+        already_delayed_s = 0.0
+        if mid:
+            prior = self.person_delays_s()
+            already_delayed_s = max((prior.get(p, 0.0) for p in state.persons), default=0.0)
         if cmd.max_extra_delay_s is not None:
-            budget = cmd.max_extra_delay_s - detour_s
+            budget = cmd.max_extra_delay_s - already_delayed_s - detour_s
+            energy = min(energy, self.session_model.deliverable_energy_kwh(budget, power))
+        elif mid and already_delayed_s > 0.0:
+            budget = self.config.max_passenger_delay_s - already_delayed_s - detour_s
             energy = min(energy, self.session_model.deliverable_energy_kwh(budget, power))
         if energy < self.config.min_delivery_kwh:
             return reject("no_feasible_energy")
@@ -668,8 +707,9 @@ class Orchestrator:
                 "required_soc": sess.target_soc,
                 "session_id": sess.id,
                 "discharge_soc_floor": sess.floor_soc if sess.direction == "discharge" else None,
+                "charge_soc_ceiling": sess.target_soc if sess.direction == "charge" else None,
             }
-            dynamics = self.config.timing_owner == "energy_model"
+            dynamics = self.config.timing_owner == "energy_model" and not bool(sess.meta.get("native"))
             if dynamics:
                 # CityLearn session dynamics: offsets from the start of the step; whole-step countdown plus the
                 # exact departure in seconds (used by backends that support it, dropped otherwise).

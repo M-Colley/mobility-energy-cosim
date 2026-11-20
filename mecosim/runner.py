@@ -34,9 +34,15 @@ __all__ = ["RunResult", "reference_backend", "make_orchestrator", "run_scenario"
 def resolve_timing_owner(spec: ScenarioSpec) -> str:
     """``energy.timing_owner`` with ``"auto"`` resolved: CityLearn with session dynamics -> ``"energy_model"``."""
     owner = spec.energy.timing_owner
+    if owner == "energy_model":
+        if spec.energy.backend != "citylearn":
+            raise ValueError("timing_owner='energy_model' requires energy.backend='citylearn'")
+        if spec.energy.transfer == "sumo_native":
+            raise ValueError("timing_owner='energy_model' cannot be combined with energy.transfer='sumo_native'")
+        return owner
     if owner != "auto":
         return owner
-    if spec.energy.backend == "citylearn":
+    if spec.energy.backend == "citylearn" and spec.energy.transfer != "sumo_native":
         from mecosim.adapters.citylearn import citylearn_supports_session_dynamics
 
         if citylearn_supports_session_dynamics():
@@ -107,6 +113,7 @@ def make_orchestrator(
     sumo_extra: list[str] | None = None,
     sumo_binary: str | None = None,
     orchestrator_options: dict[str, Any] | None = None,
+    seed: int | None = None,
 ) -> Orchestrator:
     spec = built.spec
     sim = spec.simulation
@@ -127,23 +134,26 @@ def make_orchestrator(
         built.fleet,
         built.hubs,
     )
-    cfg = OrchestratorConfig(
-        clock=clock,
-        session=spec.session.parameters(),
-        reserve=spec.reserve_parameters(),
-        timing_owner=resolve_timing_owner(spec),  # type: ignore[arg-type]
-        max_passenger_delay_s=spec.demand.max_passenger_delay_s,
-        energy_transfer=spec.energy.transfer,
+    cfg_kwargs: dict[str, Any] = {
+        "clock": clock,
+        "session": spec.session.parameters(),
+        "reserve": spec.reserve_parameters(),
+        "timing_owner": resolve_timing_owner(spec),
+        "max_passenger_delay_s": spec.demand.max_passenger_delay_s,
+        "energy_transfer": spec.energy.transfer,
         **dict(orchestrator_options or {}),
+    }
+    cfg = OrchestratorConfig(**cfg_kwargs)
+    return Orchestrator(
+        fed, policy, built.hubs, built.zones, built.fleet, cfg, seed=spec.seed if seed is None else seed
     )
-    return Orchestrator(fed, policy, built.hubs, built.zones, built.fleet, cfg, seed=spec.seed)
 
 
-def make_energy_driver(built: BuiltScenario) -> EnergyDriver:
+def make_energy_driver(built: BuiltScenario, *, horizon_s: float = 3600.0) -> EnergyDriver:
     if built.spec.energy.backend == "citylearn":
         from mecosim.adapters.citylearn import citylearn_driver
 
-        return citylearn_driver(built)
+        return citylearn_driver(built, horizon_s=horizon_s)
     return reference_backend(built)
 
 
@@ -166,10 +176,12 @@ def run_scenario(
         policy = make_policy(policy, dict(policy_params or {}))
     sumo_out = out / "sumo"
     orch = make_orchestrator(built, policy, output_dir=sumo_out, sumo_backend=sumo_backend)
-    energy = driver or make_energy_driver(built)
+    energy = driver or make_energy_driver(built, horizon_s=orch.config.horizon_s)
     t0 = time.perf_counter()
+    final_states = {}
     try:
         orch.run(energy)
+        final_states = {vid: orch.mobility.vehicle_state(vid) for vid in built.fleet}
     finally:
         orch.close()
     wall = time.perf_counter() - t0
@@ -184,11 +196,18 @@ def run_scenario(
             built.fleet,
             orch.sessions.values(),
             built.hubs,
+            end_s=sim.begin_s + sim.duration_s,
         )
     )
     cap = sum(v.capacity_kwh for v in built.fleet.values())
     hub_throughput = sum(abs(s.measured_battery_kwh) for s in orch.sessions.values())
+    driving_kwh = sum(max(0.0, st.consumed_kwh) for st in final_states.values())
+    init_kwh = sum(v.initial_soc * v.capacity_kwh for v in built.fleet.values())
+    end_kwh = sum(st.soc * st.capacity_kwh for st in final_states.values()) if final_states else init_kwh
     metrics["hub_equivalent_full_cycles"] = hub_throughput / (2.0 * cap) if cap > 0 else 0.0
+    metrics["driving_energy_kwh"] = driving_kwh
+    metrics["total_equivalent_full_cycles"] = (hub_throughput + driving_kwh) / (2.0 * cap) if cap > 0 else 0.0
+    metrics["fleet_energy_change_kwh"] = end_kwh - init_kwh
     metrics["welfare"] = welfare(metrics, welfare_weights)
     metrics["wall_time_s"] = wall
     metrics["teleports"] = float(getattr(orch.mobility, "teleports", math.nan))

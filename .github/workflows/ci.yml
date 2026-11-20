@@ -9,13 +9,14 @@ permissions:
   contents: read
 
 env:
-  # CityLearn with the external-mobility hook and charger session dynamics (branch 2 contains branch 1).
-  # Replace by "citylearn>=X.Y" once both are released.
-  CITYLEARN_SPEC: "citylearn @ git+https://github.com/M-Colley/CityLearn@feat/charger-session-dynamics"
+  # CityLearn integration branch with external-mobility hook, charger session dynamics, charge SOC ceiling & outage KPIs.
+  # Replace by "citylearn>=X.Y" once released.
+  CITYLEARN_SPEC: "citylearn @ git+https://github.com/M-Colley/CityLearn@integration/mecosim-ci"
 
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,6 +29,7 @@ jobs:
   test:
     name: test (${{ matrix.os }}, py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:

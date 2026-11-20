@@ -57,6 +57,7 @@ class _Connection:
     ev_id: str | None = None
     connected_seconds: float | None = None
     floor: float | None = None
+    ceiling: float | None = None
     session_id: str | None = None
     departure_steps: int | None = None
     required_soc: float | None = None
@@ -165,6 +166,7 @@ class ReferenceEnergyModel:
         session_id: str | None = None,
         connected_seconds: float | None = None,
         discharge_soc_floor: float | None = None,
+        charge_soc_ceiling: float | None = None,
         connected_since_seconds: float | None = None,
         departure_seconds: float | None = None,
     ) -> None:
@@ -190,7 +192,8 @@ class ReferenceEnergyModel:
             1,
             ev_id,
             connected_seconds,
-            discharge_soc_floor,
+            discharge_soc_floor if discharge_soc_floor is not None else (cur.floor if running else None),
+            charge_soc_ceiling if charge_soc_ceiling is not None else (cur.ceiling if running else None),
             session_id or cur.session_id,
             departure_steps,
             required_soc,
@@ -255,8 +258,8 @@ class ReferenceEnergyModel:
                 provider.bind(self)
             provider.reset(self)
 
-    def _charger_energy(self, cid: str, target: ChargerTarget | None) -> float:
-        """Terminal energy of charger ``cid`` in this interval after rating, connection time, SOC limits."""
+    def preview_charger_energy(self, cid: str, target: ChargerTarget | None) -> float:
+        """Feasible terminal energy of ``cid`` for ``target`` after rating, connection time and SOC limits."""
         conn = self._conn[cid]
         if conn.state != 1 or conn.ev_id is None or target is None:
             return 0.0
@@ -267,14 +270,24 @@ class ReferenceEnergyModel:
         limit = spec.nominal_kw * seconds / 3600.0
         e = float(np.clip(e, -limit, limit))
         if e >= 0:
+            ceil = 1.0 if conn.ceiling is None else conn.ceiling
             batt = battery_energy(e, spec.charge_efficiency)
-            batt = min(batt, (1.0 - ev.soc) * ev.capacity_kwh)
-            e = batt / spec.charge_efficiency
-        else:
-            floor = 0.0 if conn.floor is None else conn.floor
-            batt = battery_energy(e, spec.discharge_efficiency)  # negative
-            batt = max(batt, -max(0.0, ev.soc - floor) * ev.capacity_kwh)
-            e = batt * spec.discharge_efficiency
+            batt = min(batt, max(0.0, ceil - ev.soc) * ev.capacity_kwh)
+            return batt / spec.charge_efficiency
+        floor = 0.0 if conn.floor is None else conn.floor
+        batt = battery_energy(e, spec.discharge_efficiency)  # negative
+        batt = max(batt, -max(0.0, ev.soc - floor) * ev.capacity_kwh)
+        return batt * spec.discharge_efficiency
+
+    def _charger_energy(self, cid: str, target: ChargerTarget | None) -> float:
+        """Terminal energy of charger ``cid`` in this interval after rating, connection time, SOC limits."""
+        e = self.preview_charger_energy(cid, target)
+        conn = self._conn[cid]
+        if conn.state != 1 or conn.ev_id is None or target is None:
+            return 0.0
+        spec = self.chargers[cid]
+        ev = self.evs[conn.ev_id]
+        batt = battery_energy(e, spec.charge_efficiency if e >= 0 else spec.discharge_efficiency)
         ev.soc = float(np.clip(ev.soc + batt / ev.capacity_kwh, 0.0, 1.0))
         self.totals.battery_throughput_kwh += abs(batt)
         return e
@@ -307,7 +320,7 @@ class ReferenceEnergyModel:
             self.totals.emissions_kg += imp * carbon
             self.totals.cost += imp * price
             self.totals.pv_kwh += pv
-            self.totals.pv_used_kwh += pv - exp if pv > 0 else 0.0
+            self.totals.pv_used_kwh += float(np.clip(pv - exp, 0.0, pv))
             if zid in self.deficit_zones:
                 self.totals.deficit_kwh_baseline += max(0.0, base_net)
                 self.totals.deficit_served_kwh += min(max(0.0, base_net), max(0.0, -ev_zone[zid]))
@@ -327,8 +340,13 @@ class ReferenceEnergyModel:
                     c.departure_steps = max(0, c.departure_steps - 1)
                 self._carried.add(cid)
         done = self._t >= self._n_steps
-        if not done and self.provider is not None:
-            self.provider.update(self, self._t)
+        if self.provider is not None:
+            if not done:
+                self.provider.update(self, self._t)
+            else:
+                finalize = getattr(self.provider, "finalize", None)
+                if callable(finalize):
+                    finalize(self)
         return done
 
     def kpis(self) -> dict[str, float]:

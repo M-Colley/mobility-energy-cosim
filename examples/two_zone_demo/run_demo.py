@@ -9,9 +9,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from mecosim.paths import absolute
 from mecosim.sweep import SweepConfig, default_jobs, run_sweep
 
-HERE = Path(__file__).resolve().parent
+HERE = absolute(__file__).parent
 
 
 def main() -> None:

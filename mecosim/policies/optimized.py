@@ -171,6 +171,15 @@ class OptimizedDelivery(BasePolicy):
     def _charging_zones(self) -> list[str]:
         return self.zones_with_role("pv_rich") or list(self.context.zones)
 
+    @staticmethod
+    def _session_window(sess, now_s: float) -> tuple[float, float]:  # type: ignore[no-untyped-def]
+        start = sess.arrival_s if sess.arrival_s is not None else float(sess.meta.get("eta_s", now_s))
+        return start, start + sess.planned_duration_s
+
+    def _slot_overlaps(self, sess, now_s: float, slot: int, L: float) -> bool:  # type: ignore[no-untyped-def]
+        a, b = self._session_window(sess, now_s)
+        return a < now_s + (slot + 1) * L and b > now_s + slot * L
+
     def candidates(self, obs: FleetObservation, busy: set[str], free: dict[str, int]) -> list[Candidate]:
         ctx = self.context
         w = self.weights
@@ -182,27 +191,34 @@ class OptimizedDelivery(BasePolicy):
             else ctx.options.get("max_passenger_delay_s", 600.0)
         )
         deficit_zones = [z for z, st in obs.zones.items() if sum(st.deficit_forecast_kwh) > 1e-9]
-        hubs = [h for h in ctx.hubs.values() if h.zone in deficit_zones and free.get(h.id, 0) > 0]
+        hubs = [h for h in ctx.hubs.values() if h.zone in deficit_zones]
         out: list[Candidate] = []
         for v in obs.vehicles.values():
             if v.id in busy or not v.in_simulation or v.session_id is not None or v.soc < self.min_soc_to_deliver:
                 continue
             carrying = bool(v.persons)
-            if carrying and (not self.allow_mid_journey or not v.destination_edge):
+            if carrying and (
+                not self.allow_mid_journey
+                or not v.destination_edge
+                or any(obs.person_delays_s.get(p, 0.0) > 0.0 for p in v.persons)
+            ):
                 continue
             if not carrying and (not self.allow_idle or not v.idle):
                 continue
             spec = ctx.vehicles[v.id]
             for h in hubs:
+                if carrying and h.edge_id == v.destination_edge:
+                    continue
                 est = estimate_stop(v, h, ctx.hubs, self._charging_zones(), ctx.routing, ctx.consumption, ctx.reserve)
                 if not est.feasible:
                     continue
                 if carrying and est.detour_s > self.detour_budget_s:
                     continue
                 p = min(h.power_kw, spec.max_power_kw)
+                eta = ctx.efficiency(h.id, v.id, p, "discharge")
                 overhead = ctx.session_model.linear_overhead_s(p)
                 k = 3600.0 / p
-                e_res = max(0.0, (est.soc_arrival - est.reserve_soc) * v.capacity_kwh * h.discharge_efficiency)
+                e_res = max(0.0, (est.soc_arrival - est.reserve_soc) * v.capacity_kwh * eta)
                 if carrying:
                     budget = max_delay_default
                     slots = [min(S - 1, int(est.travel_s // L))]
@@ -210,10 +226,6 @@ class OptimizedDelivery(BasePolicy):
                     budget = self.max_idle_stop_s
                     s_min = int(est.travel_s // L)
                     slots = list(range(min(s_min, S - 1), S))
-                e_time = max(0.0, (budget - overhead - est.detour_s) / k)
-                e_max = min(e_res, e_time)
-                if e_max < self.min_delivery_kwh:
-                    continue
                 zs = obs.zones[h.zone]
                 n_pax = len(v.persons)
                 value = w.energy * (
@@ -223,26 +235,31 @@ class OptimizedDelivery(BasePolicy):
                 )
                 traffic = w.traffic_per_s_curbside * (1.0 if h.curbside else w.traffic_offstreet_factor)
                 delay_rate = w.passenger_delay * w.value_of_time_per_h / 3600.0 * n_pax
-                cost_kwh = (
-                    w.wear_per_kwh / h.discharge_efficiency
-                    + w.replacement_cost_per_kwh / h.discharge_efficiency
-                    + traffic * k
-                    + delay_rate * k
-                )
+                cost_kwh = w.wear_per_kwh / eta + w.replacement_cost_per_kwh / eta + traffic * k + delay_rate * k
                 drive_km = est.detour_km if carrying else est.travel_km
                 fixed = (
                     delay_rate * (overhead + est.detour_s)
                     + traffic * overhead
                     + w.approach_energy * drive_km * est.kwh_per_km * zs.price_per_kwh
                 )
-                occ = max(1, math.ceil((overhead + k * e_max) / L))
                 for s in slots:
+                    act_now = s == slots[0]
+                    if act_now and free.get(h.id, 0) <= 0:
+                        continue
+                    # Cap late-slot candidates to the remaining horizon so end-of-horizon slots cannot claim energy
+                    # outside [0, S*L) without paying plug/power occupancy for it.
+                    slot_budget = budget if (S * L < budget and s == 0) else min(budget, (S - s) * L)
+                    e_time = max(0.0, (slot_budget - overhead - est.detour_s) / k)
+                    e_max = min(e_res, e_time)
+                    if e_max < self.min_delivery_kwh:
+                        continue
+                    occ = max(1, math.ceil((overhead + k * e_max) / L - 1e-9))
                     out.append(
                         Candidate(
                             v,
                             h,
                             s,
-                            s == slots[0],
+                            act_now,
                             p,
                             overhead,
                             est,
@@ -259,6 +276,8 @@ class OptimizedDelivery(BasePolicy):
 
     # ------------------------------------------------------------------------------------------------ MILP
     def solve(self, obs: FleetObservation, cands: list[Candidate], free: dict[str, int]) -> MilpSolution:
+        if obs.person_delays_s or obs.step > 0:
+            self.delay_used_s = sum(obs.person_delays_s.values())
         n = len(cands)
         if n == 0:
             return MilpSolution(0, "no candidates", 0.0)
@@ -285,25 +304,36 @@ class OptimizedDelivery(BasePolicy):
             by_vehicle.setdefault(cd.vehicle.id, []).append(i)
         for idx in by_vehicle.values():
             rows.append(({i: 1.0 for i in idx}, -np.inf, 1.0))
-        # hub capacity per slot (a stop starting in slot s' occupies slots s'..s'+occ-1)
-        for hid, nfree in free.items():
-            if hid not in self.context.hubs:
-                continue
+        # hub capacity per slot (immediate act_now stops need a free plug now; future slots release finished sessions)
+        for hid, hub in self.context.hubs.items():
+            now_coeffs = {i: 1.0 for i, cd in enumerate(cands) if cd.hub.id == hid and cd.act_now}
+            if now_coeffs:
+                rows.append((now_coeffs, -np.inf, float(max(0, free.get(hid, 0)))))
             for s in range(S):
                 coeffs = {
                     i: 1.0
                     for i, cd in enumerate(cands)
                     if cd.hub.id == hid and cd.slot <= s < cd.slot + cd.occupancy_slots
                 }
-                if coeffs:
-                    rows.append((coeffs, -np.inf, float(max(0, nfree))))
-        # zone deficit cap over the horizon (minus energy already planned there)
+                if not coeffs:
+                    continue
+                if s == 0:
+                    cap_plugs = max(0, free.get(hid, 0))
+                else:
+                    running_in_s = sum(
+                        1
+                        for sess in obs.sessions.values()
+                        if sess.hub_id == hid and self._slot_overlaps(sess, obs.time_s, s, L)
+                    )
+                    cap_plugs = max(0, hub.plugs - running_in_s)
+                rows.append((coeffs, -np.inf, float(cap_plugs)))
+        # zone deficit cap over the horizon (minus remaining energy already planned/active there)
         for zid, zs in obs.zones.items():
             idx = [i for i, cd in enumerate(cands) if cd.hub.zone == zid]
             if not idx:
                 continue
             planned = sum(
-                s.energy_kwh
+                max(0.0, s.energy_kwh + s.measured_terminal_kwh)
                 for s in obs.sessions.values()
                 if s.direction == "discharge" and self.context.hubs[s.hub_id].zone == zid
             )
@@ -311,17 +341,19 @@ class OptimizedDelivery(BasePolicy):
             cap = max(0.0, sum(zs.deficit_forecast_kwh[:n_fc]) - planned)
             rows.append(({n + i: 1.0 for i in idx}, -np.inf, cap))
             # zone power cap per slot: concurrent deliveries limited to the forecast deficit power (at least one
-            # vehicle while there is a deficit), minus deliveries already running or planned in the zone
-            busy_zone = sum(
-                1
-                for s in obs.sessions.values()
-                if s.direction == "discharge" and self.context.hubs[s.hub_id].zone == zid
-            )
+            # vehicle while there is a deficit), minus deliveries overlapping that slot in the zone
             per_slot = max(1, int(round(L / self.context.clock.master_step_s)))
             for slot in range(S):
                 window = zs.deficit_forecast_kwh[slot * per_slot : (slot + 1) * per_slot]
                 if not window:
                     break
+                busy_zone = sum(
+                    1
+                    for s in obs.sessions.values()
+                    if s.direction == "discharge"
+                    and self.context.hubs[s.hub_id].zone == zid
+                    and (slot == 0 or self._slot_overlaps(s, obs.time_s, slot, L))
+                )
                 deficit_kw = sum(window) / (len(window) * self.context.clock.master_step_s / 3600.0)
                 power = max(cd.power_kw for cd in cands if cd.hub.zone == zid)
                 allowed = (max(1, int(deficit_kw // power)) if deficit_kw > 1e-9 else 0) - busy_zone

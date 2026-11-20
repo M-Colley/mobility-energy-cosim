@@ -10,6 +10,9 @@ from pathlib import Path
 
 import pandas as pd
 
+from mecosim.paths import absolute
+from mecosim.sweep import _fmt_param
+
 COLUMNS = [
     ("grid_import_kwh", "Grid import (kWh)", 1),
     ("emissions_kg", "Emissions (kg CO2)", 2),
@@ -28,12 +31,12 @@ def label(row: pd.Series) -> str:
     params = [c for c in row.index if c.startswith("param.") and pd.notna(row[c])]
     if not params:
         return str(row["label"])
-    inner = ", ".join(f"{c[len('param.') :].split('.')[-1]}={row[c]:g}" for c in params)
+    inner = ", ".join(f"{c[len('param.') :].split('.')[-1]}={_fmt_param(row[c])}" for c in params)
     return f"{row['label']} ({inner})"
 
 
 def main() -> None:
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent / "output"
+    out = Path(sys.argv[1]) if len(sys.argv) > 1 else absolute(__file__).parent / "output"
     summary = pd.read_csv(out / "summary.csv")
     pareto = set(pd.read_csv(out / "pareto.csv")["config"]) if (out / "pareto.csv").exists() else set()
     header = "| Policy | " + " | ".join(h for _, h, _ in COLUMNS) + " | Pareto |"

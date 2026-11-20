@@ -153,7 +153,9 @@ class BasePolicy:
             hub = self.nearest_hub(v, self.hubs_in(zones), free)
             if hub is None:
                 continue
-            energy = min(chunk, max(0.0, (target - v.soc) * v.capacity_kwh / hub.charge_efficiency))
+            power = min(hub.power_kw, self.context.vehicles[v.id].max_power_kw)
+            eta = self.context.efficiency(hub.id, v.id, power, "charge")
+            energy = min(chunk, max(0.0, (target - v.soc) * v.capacity_kwh / eta))
             if energy <= 0.05:
                 continue
             if surplus and energy < self.surplus_min_energy_kwh(v.id, hub):

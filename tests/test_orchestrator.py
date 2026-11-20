@@ -185,3 +185,40 @@ def test_same_vehicle_back_to_back_on_one_plug() -> None:
     orch.run(energy)
     sessions = sorted(orch.sessions.values(), key=lambda s: s.command_time_s)
     assert [s.status for s in sessions] == [SessionStatus.DONE, SessionStatus.DONE]
+
+
+def test_pv_self_consumption_clipped_and_horizon_dwell_bounded() -> None:
+    from mecosim.metrics.mobility import session_metrics
+
+    # Over-discharging into a zero-PV east zone must not reduce west PV self-consumption or make it negative.
+    orch, _, energy = make({0.0: [EnergyStop("av0", "poor", 5.0)]}, n_steps=40)
+    energy.zones["east"].load_kw[:] = 0.0  # all 5 kWh discharged in east are exported
+    orch.run(energy)
+    k = energy.kpis()
+    assert 0.0 <= k["pv_self_consumption"] <= 1.0
+    # Active session at horizon end has its dwell clipped to end_s.
+    orch2, _, energy2 = make({0.0: [EnergyStop("av0", "poor", 5.0)]}, n_steps=5)
+    orch2.run(energy2)
+    (s_act,) = orch2.sessions.values()
+    assert s_act.status == SessionStatus.ACTIVE
+    m = session_metrics([s_act], orch2.hubs, end_s=300.0)
+    assert m["stop_dwell_s"] == pytest.approx(300.0 - (s_act.arrival_s or 0.0))
+
+
+def test_substep_done_session_clears_vehicle_session_flag() -> None:
+    from mecosim.core.protocols import DispatchTaxi
+
+    orch, mob, energy = make({}, n_steps=10, step=60.0)
+    orch.config.clock = Clock(60.0, 1.0, 0.0, decision_period_s=15.0)
+    orch.clock = orch.config.clock
+    model = SessionModel()
+    # Small session starting at t=1 s, ending mid-step inside a later 60 s interval.
+    dur = model.stop_duration_s(0.05, 11.0)
+    mob.v["av1"].edge = "0,0"  # already at rich hub -> arrival at t=1 s
+    orch.policy = ScriptedPolicy({0.0: [EnergyStop("av1", "rich", 0.05, direction="charge")]})
+    orch.run(energy)
+    (sess,) = orch.sessions.values()
+    assert sess.status == SessionStatus.DONE and sess.departure_s == pytest.approx(1.0 + np.ceil(dur), abs=1.0)
+    # Dispatching after the session is DONE succeeds cleanly.
+    res = orch._dispatch(DispatchTaxi("av1", ("r0",)))
+    assert res["ok"] is True

@@ -166,4 +166,8 @@ def patch_schema(
         for name, adef in s.get("actions", {}).items():
             adef["active"] = name == "electric_vehicle_storage"
         s.setdefault("actions", {}).setdefault("electric_vehicle_storage", {})["active"] = True
+    else:
+        s.setdefault("actions", {}).setdefault("electric_vehicle_storage", {})["active"] = True
+        if "hour" in s.get("observations", {}):
+            s["observations"]["hour"]["active"] = True
     return s, hub_building
