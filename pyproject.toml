@@ -28,6 +28,7 @@ dependencies = [
     "sumolib>=1.24",
     "traci>=1.24",
     "libsumo>=1.24",
+    "v2x-interop @ git+https://github.com/M-Colley/v2x-interop@main",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +40,7 @@ analysis = ["pymoo>=0.6.1", "matplotlib>=3.7"]
 dev = [
     "pytest>=8",
     "ruff>=0.6",
+    "pyarrow>=15",
     "gymnasium>=1.0",
     "pettingzoo>=1.24",
     "mosaik-api-v3>=3.0",

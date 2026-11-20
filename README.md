@@ -228,6 +228,24 @@ mecosim and CARLA's SUMO co-simulation bridge run as two TraCI clients of one SU
 `setOrder`), at the bridge's 0.05 s step. See [docs/carla.md](docs/carla.md). Lockstep is tested with a stub client
 that mimics the bridge; CARLA itself was not run.
 
+## Multiparty V2X standards, battery SOH & UK 2 GW flexibility pack (`v2x-interop` + `mecosim ukri-report`)
+
+Reusable standards and UK distribution-network primitives live in the standalone
+[`v2x-interop`](https://github.com/M-Colley/v2x-interop) package (`ISO 15118-20` Dynamic/Scheduled BPT envelopes,
+`OCPP 2.1` bidirectional `SetChargingProfile` wire codecs, `OpenADR 3.0` events, 5-party HMAC-authenticated session
+arbitration, the 12-case **IEA Task 53** interoperability matrix, `NMC811`/`LFP` battery SOH calendar-vs-driving-vs-V2X
+wear attribution, UK half-hourly seasonal Agile/DFS/NESO profiles, **ENA G99/G100** LV feeder envelopes with statutory
+230 V +10 %/−6 % voltage checks, UK DSO `Sustain`/`Secure`/`Dynamic`/`Restore` settlement, and Monte Carlo `P50`/`P90`
+extrapolation to the **UK 2030 2 GW Consumer-Led Flexibility** target across all 6 UK DNO groups).
+
+In `mecosim`, set `uk_v2x.enabled: true` and optional heterogeneous `fleet_archetypes` (`domestic_v2h`,
+`kerbside_public`, `commercial_depot`, `utility_v2l`, `ride_hail` — see `examples/uk_v2x_2030_demo/scenario.yaml`), or
+generate a full multi-seasonal evidence pack and interactive HTML5 explorer with one command:
+
+```bash
+mecosim ukri-report examples/uk_v2x_2030_demo/scenario.yaml --policy optimized --out output/ukri_2030
+```
+
 ## Limitations
 
 - **CARLA not run**: the integration follows CARLA's bridge source and is tested with a stub client only.

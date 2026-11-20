@@ -9,6 +9,7 @@ from mecosim.viz.replay import (
     render_replay_html,
     snapshot_observation,
 )
+from mecosim.viz.ukri_html import render_ukri_evidence_html
 
 __all__ = [
     "snapshot_observation",
@@ -16,4 +17,5 @@ __all__ = [
     "build_replay_bundle",
     "render_replay_html",
     "render_pareto_html",
+    "render_ukri_evidence_html",
 ]

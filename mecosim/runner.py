@@ -24,6 +24,7 @@ from mecosim.energy.reference import (
     ChargerSpec,
     EVSpec,
     ReferenceEnergyModel,
+    ZoneProfile,
     synthetic_zone_profile,
     zone_import_caps_kw,
 )
@@ -92,20 +93,42 @@ def reference_backend(built: BuiltScenario) -> ReferenceEnergyModel:
         if spec.energy.outages
         else {}
     )
-    zones = {
-        z.id: synthetic_zone_profile(
-            sim.n_steps + 1,
-            sim.master_step_s,
-            start_hour=sim.start_hour,
-            pv_kwp=z.pv_kwp * z.pv_scale,
-            load_kw_mean=z.load_kw_mean,
-            carbon_kg_per_kwh=spec.energy.carbon_kg_per_kwh,
-            price_per_kwh=spec.energy.price_per_kwh,
-            max_import_kw=caps.get(z.id, math.inf),
-            seed=spec.seed + i,
-        )
-        for i, z in enumerate(spec.zones)
-    }
+    if spec.uk_v2x.enabled:
+        from mecosim.uk_v2x.driver import uk_seasonal_zone_arrays
+
+        zones = {}
+        for i, z in enumerate(spec.zones):
+            arrs = uk_seasonal_zone_arrays(
+                spec.uk_v2x.season,
+                n_steps=sim.n_steps + 1,
+                step_s=sim.master_step_s,
+                start_hour=sim.start_hour,
+                pv_kwp=z.pv_kwp * z.pv_scale,
+                load_kw_mean=z.load_kw_mean,
+                seed=spec.seed + i,
+            )
+            zones[z.id] = ZoneProfile(
+                load_kw=arrs["load_kw"],
+                pv_kw=arrs["pv_kw"],
+                carbon_kg_per_kwh=arrs["carbon_kg_per_kwh"],
+                price_per_kwh=arrs["price_per_kwh"],
+                max_import_kw=caps.get(z.id, math.inf),
+            )
+    else:
+        zones = {
+            z.id: synthetic_zone_profile(
+                sim.n_steps + 1,
+                sim.master_step_s,
+                start_hour=sim.start_hour,
+                pv_kwp=z.pv_kwp * z.pv_scale,
+                load_kw_mean=z.load_kw_mean,
+                carbon_kg_per_kwh=spec.energy.carbon_kg_per_kwh,
+                price_per_kwh=spec.energy.price_per_kwh,
+                max_import_kw=caps.get(z.id, math.inf),
+                seed=spec.seed + i,
+            )
+            for i, z in enumerate(spec.zones)
+        }
     chargers = {
         cid: ChargerSpec(h.zone, h.power_kw, h.charge_efficiency, h.discharge_efficiency)
         for h in built.hubs.values()
@@ -169,8 +192,14 @@ def make_energy_driver(built: BuiltScenario, *, horizon_s: float = 3600.0) -> En
     if built.spec.energy.backend == "citylearn":
         from mecosim.adapters.citylearn import citylearn_driver
 
-        return citylearn_driver(built, horizon_s=horizon_s)
-    return reference_backend(built)
+        base_drv: EnergyDriver = citylearn_driver(built, horizon_s=horizon_s)
+    else:
+        base_drv = reference_backend(built)
+    if built.spec.uk_v2x.enabled:
+        from mecosim.uk_v2x.driver import UKV2XProtocolEnergyDriver
+
+        return UKV2XProtocolEnergyDriver(base_drv, built)
+    return base_drv
 
 
 def run_scenario(
@@ -244,6 +273,10 @@ def run_scenario(
     if write:
         with open(out / "metrics.json", "w", encoding="utf-8") as fh:
             json.dump({"params": result.params, "metrics": metrics}, fh, indent=2, default=float)
+        if hasattr(energy, "report_bundle") and callable(energy.report_bundle):
+            (out / "uk_v2x_bundle.json").write_text(
+                json.dumps(energy.report_bundle(), indent=2, default=float), encoding="utf-8"
+            )
         result.sessions_frame().to_csv(out / "sessions.csv", index=False)
         orch.log.write_jsonl(out / "events.jsonl")
         net_geom = extract_network_geometry(built.net_file, built.zone_of_edge, built.hubs)

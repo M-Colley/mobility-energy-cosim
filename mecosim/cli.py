@@ -164,6 +164,34 @@ def _cmd_pareto_html(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ukri_report(args: argparse.Namespace) -> int:
+    from mecosim.uk_v2x.evidence import DEFAULT_UK_SEASONS, generate_ukri_evidence_pack
+
+    seasons = tuple(s.strip() for s in args.seasons.split(",") if s.strip()) if args.seasons else DEFAULT_UK_SEASONS
+    evidence = generate_ukri_evidence_pack(
+        args.scenario,
+        args.out,
+        policy=args.policy,
+        seasons=seasons,
+        sumo_backend=args.backend,
+        render_html=not args.no_html,
+    )
+    scale = evidence.get("uk_2gw_scale_up", {})
+    print(
+        json.dumps(
+            {
+                "seasons_evaluated": evidence["seasons_evaluated"],
+                "task53_pass_rate_pct": evidence["task53_interoperability"]["pass_rate_pct"],
+                "firm_p90_kw_per_ev": scale.get("effective_kw_per_enrolled_ev", {}).get("p90_firm_kw"),
+                "evs_needed_for_2gw_p90": scale.get("uk_2030_scale_up", {}).get("enrolled_v2x_evs_for_target_p90_firm"),
+                "output_dir": str(absolute(args.out)),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def _cmd_info(_: argparse.Namespace) -> int:
     from mecosim.policies import POLICIES
 
@@ -174,6 +202,10 @@ def _cmd_info(_: argparse.Namespace) -> int:
         info["sumo"] = version("eclipse-sumo")
     except PackageNotFoundError:
         info["sumo"] = None
+    try:
+        info["v2x_interop"] = version("v2x-interop")
+    except PackageNotFoundError:
+        info["v2x_interop"] = None
     try:
         import inspect
 
@@ -254,6 +286,20 @@ def build_parser() -> argparse.ArgumentParser:
     ph.add_argument("sweep_dir", help="sweep output directory containing summary.csv")
     ph.add_argument("--out", help="output HTML path (default: <sweep_dir>/pareto.html)")
     ph.set_defaults(func=_cmd_pareto_html)
+
+    uk = sub.add_parser(
+        "ukri-report",
+        help="run multi-seasonal UK V2X co-simulations + Task 53 interop matrix & 2 GW scale-up HTML pack",
+    )
+    uk.add_argument("scenario", help="scenario YAML (e.g. examples/uk_v2x_2030_demo/scenario.yaml)")
+    uk.add_argument("--policy", default="optimized")
+    uk.add_argument(
+        "--seasons", help="comma-separated UK seasons (default: winter_peak,summer_solar,autumn_wind,storm_outage)"
+    )
+    uk.add_argument("--out", default="output/ukri_report")
+    uk.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
+    uk.add_argument("--no-html", action="store_true")
+    uk.set_defaults(func=_cmd_ukri_report)
 
     i = sub.add_parser("info", help="versions and available policies")
     i.set_defaults(func=_cmd_info)
