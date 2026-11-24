@@ -33,9 +33,10 @@ class MecosimParallelEnv(ParallelEnv):
         max_energy_kwh: float = 10.0,
         reward: RewardWeights | None = None,
         sumo_backend: str = "libsumo",
+        **env_kwargs: Any,
     ) -> None:
         self.central = MecosimEnv(
-            scenario, out_dir, max_energy_kwh=max_energy_kwh, reward=reward, sumo_backend=sumo_backend
+            scenario, out_dir, max_energy_kwh=max_energy_kwh, reward=reward, sumo_backend=sumo_backend, **env_kwargs
         )
         self.possible_agents = list(self.central.vehicle_ids)
         self.agents: list[str] = []
