@@ -10,6 +10,13 @@ import pytest
 
 pytest.importorskip("citylearn")
 pytest.importorskip("citylearn.mobility")
+_cl_data = pytest.importorskip("citylearn.data")
+if "electric_vehicle_trip_energy_kwh" not in getattr(
+    getattr(_cl_data, "ChargerSimulation", None), "SESSION_COLUMNS", ()
+):
+    pytest.skip(
+        "CityLearn without trace-replay charger columns (citylearn-project/CityLearn#396)", allow_module_level=True
+    )
 
 from mecosim.export.citylearn import record_run, replay, write_dataset  # noqa: E402
 from tests.sumo_helpers import EnergyStop, Script, tiny_spec  # noqa: E402
