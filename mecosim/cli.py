@@ -1,4 +1,4 @@
-"""Command-line interface: ``mecosim run``, ``mecosim sweep``, ``mecosim build``, ``mecosim info``."""
+"""Command-line interface: ``mecosim run``, ``sweep``, ``build``, ``export-citylearn`` and ``info``."""
 
 from __future__ import annotations
 
@@ -99,6 +99,21 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_export_citylearn(args: argparse.Namespace) -> int:
+    from mecosim.export.citylearn import export_citylearn
+    from mecosim.scenarios.spec import ScenarioSpec
+
+    spec = ScenarioSpec.from_yaml(args.scenario)
+    if args.set:
+        spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
+    seeds = [int(x) for x in args.seeds.split(",")]
+    for path in export_citylearn(
+        spec, args.policy, seeds, args.out, _parse_params(args.param or []), sumo_backend=args.backend
+    ):
+        print(path)
+    return 0
+
+
 def _cmd_info(_: argparse.Namespace) -> int:
     from mecosim.policies import POLICIES
 
@@ -165,6 +180,16 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("scenario")
     b.add_argument("--out", default="output/scenario")
     b.set_defaults(func=_cmd_build)
+
+    e = sub.add_parser("export-citylearn", help="run live once per seed and write plain CityLearn datasets")
+    e.add_argument("scenario", help="scenario YAML (energy.backend: citylearn)")
+    e.add_argument("--policy", default="no_delivery")
+    e.add_argument("--param", action="append", help="policy parameter key=value (dotted keys nest)")
+    e.add_argument("--set", action="append", help="scenario override key=value")
+    e.add_argument("--seeds", default="1", help="comma-separated seeds")
+    e.add_argument("--out", default="output/citylearn_export")
+    e.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
+    e.set_defaults(func=_cmd_export_citylearn)
 
     i = sub.add_parser("info", help="versions and available policies")
     i.set_defaults(func=_cmd_info)
