@@ -12,6 +12,7 @@ in the step, plus ``value per kWh x deficit served`` when configured.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,8 @@ class MecosimEnv(gym.Env):
         max_energy_kwh: Upper bound of the energy action per stop.
         reward: Reward weights.
         sumo_backend: ``"libsumo"`` (default) or ``"traci"``.
+        fidelity: Mobility federate (``"sumo"`` or ``"surrogate"``), or a callable ``episode_index -> fidelity`` (for
+            example :class:`mecosim.rl.schedule.FidelitySchedule`); ``None`` uses ``simulation.fidelity``.
     """
 
     metadata = {"render_modes": []}
@@ -98,6 +101,7 @@ class MecosimEnv(gym.Env):
         max_energy_kwh: float = 10.0,
         reward: RewardWeights | None = None,
         sumo_backend: str = "libsumo",
+        fidelity: str | Callable[[int], str] | None = None,
     ) -> None:
         super().__init__()
         self.out_dir = absolute(out_dir)
@@ -106,6 +110,8 @@ class MecosimEnv(gym.Env):
         )
         self.reward_weights = reward or RewardWeights()
         self.sumo_backend = sumo_backend
+        self.fidelity = fidelity
+        self.current_fidelity = self.built.spec.simulation.fidelity
         self.max_energy_kwh = float(max_energy_kwh)
         self.vehicle_ids = sorted(self.built.fleet)
         self.hub_ids = sorted(self.built.hubs)
@@ -134,6 +140,8 @@ class MecosimEnv(gym.Env):
         from mecosim.runner import make_energy_driver, make_orchestrator
 
         self.close()
+        if self.fidelity is not None:
+            self.current_fidelity = self.fidelity(self._episode) if callable(self.fidelity) else self.fidelity
         self.policy = ActionPolicy()
         run_dir = self.out_dir / f"episode_{self._episode:04d}"
         self.orchestrator = make_orchestrator(
@@ -142,6 +150,7 @@ class MecosimEnv(gym.Env):
             output_dir=run_dir,
             sumo_backend=self.sumo_backend,  # type: ignore[arg-type]
             seed=seed,
+            fidelity=self.current_fidelity,  # type: ignore[arg-type]
         )
         self.driver = make_energy_driver(self.built, horizon_s=self.orchestrator.config.horizon_s)
 
@@ -217,6 +226,7 @@ class MecosimEnv(gym.Env):
         obs = self._observe()
         info = {"time_s": self.orchestrator.mobility.time_s, "step": self._steps}
         if done:
+            info["episode_kpis"] = {**totals, "passenger_delay_s": delay, "fidelity": self.current_fidelity}
             self.close()
         return obs, float(reward), done, False, info
 

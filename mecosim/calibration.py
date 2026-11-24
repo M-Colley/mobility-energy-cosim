@@ -82,6 +82,9 @@ class SpeedField:
     bin_s: float
     edge_ids: list[str]
     speed: np.ndarray  # (n_bins, n_edges)
+    #: Typical speed relative to the speed limit of an uncongested edge (accelerating, turning, stopping). The SUMO
+    #: replay imposes ``speed / reference_ratio`` so that this intrinsic slowdown is not applied twice.
+    reference_ratio: float = 1.0
 
     @property
     def n_bins(self) -> int:
@@ -283,6 +286,24 @@ def pool_speed_fields(files: Sequence[Path], graph_ids: list[str], free_speed: n
     return pooled, ratio
 
 
+def reference_ratio(files: Sequence[Path], graph_ids: list[str], free_speed: np.ndarray, q: float = 0.75) -> float:
+    """Sampled-seconds weighted ``q``-quantile of the cells' speed relative to the limit (uncongested reference)."""
+    rel: list[np.ndarray] = []
+    wts: list[np.ndarray] = []
+    for f in files:
+        ids, speed, weight, _ = _load_seed(f)
+        s, w = _to_graph_order(ids, speed, weight, graph_ids)
+        ok = np.isfinite(s) & (w > 0)
+        rel.append((s / free_speed[None, :])[ok])
+        wts.append(w[ok])
+    r, w = np.concatenate(rel), np.concatenate(wts)
+    if len(r) == 0:
+        return 1.0
+    order = np.argsort(r)
+    cum = np.cumsum(w[order])
+    return float(r[order][np.searchsorted(cum, q * cum[-1])])
+
+
 def calibrate(
     spec: ScenarioSpec,
     seeds: Sequence[int],
@@ -333,15 +354,28 @@ def calibrate(
     return cal
 
 
-def speed_field_for(spec: ScenarioSpec, root: Path | None = None, *, bin_s: float = BIN_S) -> SpeedField:
+_FIELDS: dict[tuple[str, int, str], SpeedField] = {}
+
+
+def speed_field_for(
+    spec: ScenarioSpec, net_file: Path | None = None, root: Path | None = None, *, bin_s: float = BIN_S
+) -> SpeedField:
     """Speed field of the scenario's own seed (calibration run with full background, cached) for ``speed_field``."""
     from mecosim.adapters.surrogate.network import RoadGraph
     from mecosim.scenarios.build import _generate_network
 
+    key = (scenario_hash(spec), spec.seed, str(root))
+    hit = _FIELDS.get(key)
+    if hit is not None:
+        return hit
     f = run_calibration_seed(spec, spec.seed, root, bin_s=bin_s)
     meta = _load_seed(f)[3]
-    work = f.parent / "graph"
-    work.mkdir(parents=True, exist_ok=True)
-    graph = RoadGraph(_generate_network(spec, work))
+    if net_file is None:
+        work = f.parent / "graph"
+        work.mkdir(parents=True, exist_ok=True)
+        net_file = _generate_network(spec, work)
+    graph = RoadGraph(net_file)
     pooled, _ = pool_speed_fields([f], graph.ids, graph.free_speed)
-    return SpeedField(float(meta["begin_s"]), float(meta["bin_s"]), graph.ids, pooled)
+    ref = reference_ratio([f], graph.ids, graph.free_speed)
+    _FIELDS[key] = SpeedField(float(meta["begin_s"]), float(meta["bin_s"]), graph.ids, pooled, ref)
+    return _FIELDS[key]

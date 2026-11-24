@@ -34,6 +34,8 @@ dependencies = [
 # CityLearn with the external-mobility hook. Until it is released, CI installs it from git (see .github/workflows/ci.yml).
 citylearn = ["citylearn"]
 rl = ["gymnasium>=1.0", "pettingzoo>=1.24"]
+# PPO trainer of `mecosim train-rl` (MIT).
+train = ["gymnasium>=1.0", "stable-baselines3>=2.3"]
 mosaik = ["mosaik-api-v3>=3.0"]
 analysis = ["pymoo>=0.6.1", "matplotlib>=3.7"]
 dev = [
@@ -44,6 +46,7 @@ dev = [
     "mosaik-api-v3>=3.0",
     "pymoo>=0.6.1",
     "matplotlib>=3.7",
+    "stable-baselines3>=2.3",
 ]
 
 [project.scripts]

@@ -1,9 +1,10 @@
 """Replay recorded per-edge mean speeds in SUMO instead of simulating background traffic (``speed_field`` mode).
 
 At every bin boundary the controller sets the maximum speed of each edge's lanes to the recorded mean speed and adapts
-the edge travel times used for routing (``edge.adaptTraveltime``). The recording comes from a calibration run with full
-background traffic (:func:`mecosim.calibration.speed_field_for`). Effects of the fleet on the background traffic (for
-example a curbside stop that blocks a lane) are not reproduced.
+the edge travel times used for routing (``edge.adaptTraveltime``). The recorded speed is divided by the field's
+``reference_ratio`` first, because it already contains the intrinsic slowdown of acceleration and turning. The recording
+comes from a calibration run with full background traffic (:func:`mecosim.calibration.speed_field_for`). Effects of the
+fleet on the background traffic (for example a curbside stop that blocks a lane) are not reproduced.
 """
 
 from __future__ import annotations
@@ -53,7 +54,9 @@ class SpeedFieldController:
         for (eid, lanes, length, limit), v in zip(self._lanes, row):
             if not math.isfinite(v):
                 continue
-            v = float(np.clip(v, self.min_speed_mps, limit * self.max_factor))
+            v = float(
+                np.clip(v / getattr(self.field, "reference_ratio", 1.0), self.min_speed_mps, limit * self.max_factor)
+            )
             for lane in lanes:
                 api.lane.setMaxSpeed(lane, v)
             api.edge.adaptTraveltime(eid, length / v, begin, end + 1e6 if b == self.field.n_bins - 1 else end)

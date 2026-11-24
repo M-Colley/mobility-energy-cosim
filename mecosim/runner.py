@@ -134,7 +134,7 @@ def make_orchestrator(
             step_length_s=sim.mobility_step_s,
             output_dir=output_dir,
             routing_vtype="av_taxi",
-            speed_field=_speed_field(spec),
+            speed_field=_speed_field(built),
         ),
         built.fleet,
         built.hubs,
@@ -158,13 +158,13 @@ def make_orchestrator(
     )
 
 
-def _speed_field(spec: ScenarioSpec) -> Any:
+def _speed_field(built: BuiltScenario) -> Any:
     """Recorded edge speeds for ``demand.background_mode: speed_field`` (``None`` otherwise)."""
-    if spec.demand.background_mode != "speed_field":
+    if built.spec.demand.background_mode != "speed_field":
         return None
     from mecosim.calibration import speed_field_for
 
-    return speed_field_for(spec)
+    return speed_field_for(built.spec, built.net_file)
 
 
 def make_energy_driver(built: BuiltScenario, *, horizon_s: float = 3600.0) -> EnergyDriver:
