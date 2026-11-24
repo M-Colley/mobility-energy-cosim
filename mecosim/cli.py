@@ -1,4 +1,5 @@
-"""Command-line interface: ``run``, ``sweep``, ``build``, ``train-rl``, ``replay``, ``pareto-html``, ``info``."""
+"""Command-line interface: ``run``, ``sweep``, ``build``, ``calibrate``, ``train-rl``, ``train-env``, ``replay``,
+``pareto-html``, ``ukri-report``, ``info``."""
 
 from __future__ import annotations
 
@@ -192,6 +193,57 @@ def _cmd_ukri_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _seed_list(text: str) -> list[int]:
+    """``1,2,5`` or ``1-5``."""
+    out: list[int] = []
+    for part in text.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            out += list(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    from mecosim.calibration import calibrate, calibration_path
+    from mecosim.scenarios.spec import ScenarioSpec
+
+    spec = ScenarioSpec.from_yaml(args.scenario)
+    if args.set:
+        spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
+    cache = absolute(args.cache) if args.cache else None
+    cal = calibrate(spec, _seed_list(args.seeds), cache, jobs=args.jobs, force=args.force, out=args.out)
+    target = absolute(args.out) if args.out else calibration_path(spec, cache)
+    print(
+        json.dumps(
+            {
+                "calibration": str(target),
+                "seeds": cal.seeds,
+                "kwh_per_km": round(cal.kwh_per_km, 4),
+                "leg_overhead_s": round(cal.leg_overhead_s, 2),
+                "junction_s": round(cal.junction_s, 2),
+                **cal.meta,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_train_env(args: argparse.Namespace) -> int:
+    from mecosim.rl.train import run_cli
+    from mecosim.scenarios.spec import ScenarioSpec
+
+    spec = ScenarioSpec.from_yaml(args.scenario)
+    if args.set:
+        spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
+    out = absolute(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    print(json.dumps(run_cli(args, spec, out), indent=2))
+    return 0
+
+
 def _cmd_info(_: argparse.Namespace) -> int:
     from mecosim.policies import POLICIES
 
@@ -300,6 +352,30 @@ def build_parser() -> argparse.ArgumentParser:
     uk.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
     uk.add_argument("--no-html", action="store_true")
     uk.set_defaults(func=_cmd_ukri_report)
+
+    c = sub.add_parser("calibrate", help="record speeds, consumption and stop timing from full SUMO runs")
+    c.add_argument("scenario")
+    c.add_argument("--seeds", default="1,2,3", help="calibration seeds, e.g. 1,2,3 or 1-5")
+    c.add_argument("--jobs", type=int, default=1, help="parallel processes")
+    c.add_argument("--set", action="append", help="scenario override key=value")
+    c.add_argument("--cache", help="cache directory (default: $MECOSIM_CACHE or output/calibration)")
+    c.add_argument("--out", help="calibration file (default: <cache>/<scenario hash>/calibration.npz)")
+    c.add_argument("--force", action="store_true", help="rerun cached seeds")
+    c.set_defaults(func=_cmd_calibrate)
+
+    t = sub.add_parser(
+        "train-env", help="train PPO (Stable-Baselines3) on MecosimEnv, optionally on a fidelity curriculum"
+    )
+    t.add_argument("scenario")
+    t.add_argument("--timesteps", type=int, default=6000, help="environment steps (one per master step)")
+    t.add_argument("--fidelity-schedule", help="episode mixture, e.g. surrogate:0.8,sumo:0.2")
+    t.add_argument("--train-fidelity", choices=["sumo", "surrogate"], help="single training fidelity")
+    t.add_argument("--eval-fidelity", choices=["sumo", "surrogate"], default="sumo")
+    t.add_argument("--eval-episodes", type=int, default=5)
+    t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--set", action="append", help="scenario override key=value")
+    t.add_argument("--out", default="output/train_rl")
+    t.set_defaults(func=_cmd_train_env)
 
     i = sub.add_parser("info", help="versions and available policies")
     i.set_defaults(func=_cmd_info)

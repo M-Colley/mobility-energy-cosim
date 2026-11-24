@@ -68,6 +68,8 @@ class SumoFederateConfig:
     stop_parking: bool = True
     mode: str = "micro"
     state_file: Path | None = None
+    #: Recorded edge speeds replayed instead of background traffic (``demand.background_mode: speed_field``).
+    speed_field: object | None = None
 
 
 class SumoFederate:
@@ -106,6 +108,7 @@ class SumoFederate:
         self._t_start = 0.0
         self._warm_state = False
         self._warm_time = 0.0
+        self._speed_field = None
 
     # ------------------------------------------------------------------------------------------- lifecycle
     @property
@@ -134,6 +137,12 @@ class SumoFederate:
     def _init_stations(self) -> None:
         self._station_meta.clear()
         self._active_native_v2g.clear()
+        if self.config.speed_field is not None:
+            from mecosim.adapters.sumo.speed_field import SpeedFieldController
+
+            self._speed_field = SpeedFieldController(self.config.speed_field)
+            self._speed_field.start(self.api)
+            self._speed_field.apply(self.api, self.time_s)
         for hub in self.hubs.values():
             if self.config.zero_station_power:
                 self.api.chargingstation.setChargingPower(hub.station_id, 0.0)
@@ -210,6 +219,8 @@ class SumoFederate:
         self._pending_events.clear()
         eps = 1e-6
         while self.time_s < until_s - eps:
+            if self._speed_field is not None:
+                self._speed_field.apply(api, self.time_s)
             api.simulationStep()
             t = self.time_s
             events.extend(self._enforce_scheduled_ends(t))

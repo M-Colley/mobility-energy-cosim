@@ -36,6 +36,8 @@ dependencies = [
 citylearn = ["citylearn", "pyarrow>=15"]
 rl = ["gymnasium>=1.0", "pettingzoo>=1.24"]
 rllib = ["ray[rllib]>=2.9"]
+# PPO trainer of `mecosim train-env` (MIT).
+train = ["gymnasium>=1.0", "stable-baselines3>=2.3"]
 mosaik = ["mosaik-api-v3>=3.0"]
 analysis = ["pymoo>=0.6.1", "matplotlib>=3.7"]
 dev = [

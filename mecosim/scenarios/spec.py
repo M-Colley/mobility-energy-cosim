@@ -117,6 +117,10 @@ class DemandSpec(_Model):
     max_passenger_delay_s: float = 600.0
     background_period_s: float | None = 8.0
     background_fringe_factor: float = 5.0
+    #: ``"full"`` inserts the background vehicles. ``"speed_field"`` inserts none and imposes the per-edge mean speeds
+    #: recorded in a calibration run with full background (``docs/fidelity.md``); curbside-stop effects on background
+    #: traffic cannot be measured in this mode.
+    background_mode: Literal["full", "speed_field"] = "full"
 
 
 class SimulationSpec(_Model):
@@ -137,6 +141,10 @@ class SimulationSpec(_Model):
     #: Upper bound of a random delay (drawn per episode by ``MecosimEnv``) between the end of the warm-up and master
     #: step 0. Ride requests accumulate during it. Demand is generated for ``duration_s + start_offset_max_s``.
     start_offset_max_s: float = 0.0
+    #: Mobility federate: ``"sumo"`` (default) or ``"surrogate"`` (pure-Python event simulation, ``docs/fidelity.md``).
+    fidelity: Literal["sumo", "surrogate"] = "sumo"
+    #: Calibration artifact of the surrogate; ``None`` uses the cache entry of the scenario (``mecosim calibrate``).
+    calibration_file: Path | None = None
 
     @model_validator(mode="after")
     def _validate_steps(self) -> SimulationSpec:

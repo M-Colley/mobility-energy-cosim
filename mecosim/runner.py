@@ -166,6 +166,7 @@ def make_orchestrator(
     sumo_binary: str | None = None,
     orchestrator_options: dict[str, Any] | None = None,
     seed: int | None = None,
+    fidelity: Literal["sumo", "surrogate"] | None = None,
 ) -> Orchestrator:
     spec = built.spec
     sim = spec.simulation
@@ -188,10 +189,15 @@ def make_orchestrator(
             routing_vtype="av_taxi",
             mode=sim.mode,
             state_file=output_dir / "warm_state.sbx" if opts.get("rewind_on_reset") and sim.warmup_s > 0 else None,
+            speed_field=_speed_field(built),
         ),
         built.fleet,
         built.hubs,
     )
+    if (fidelity or sim.fidelity) == "surrogate":
+        from mecosim.adapters.surrogate import surrogate_from_built
+
+        fed = surrogate_from_built(built, output_dir=output_dir)
     cfg_kwargs: dict[str, Any] = {
         "clock": clock,
         "session": spec.session.parameters(),
@@ -205,6 +211,15 @@ def make_orchestrator(
     return Orchestrator(
         fed, policy, built.hubs, built.zones, built.fleet, cfg, seed=spec.seed if seed is None else seed
     )
+
+
+def _speed_field(built: BuiltScenario) -> Any:
+    """Recorded edge speeds for ``demand.background_mode: speed_field`` (``None`` otherwise)."""
+    if built.spec.demand.background_mode != "speed_field":
+        return None
+    from mecosim.calibration import speed_field_for
+
+    return speed_field_for(built.spec, built.net_file)
 
 
 def make_energy_driver(built: BuiltScenario, *, horizon_s: float = 3600.0) -> EnergyDriver:

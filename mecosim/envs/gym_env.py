@@ -14,6 +14,7 @@ in the step, plus ``value per kWh x deficit served`` when configured.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -97,6 +98,8 @@ class MecosimEnv(gym.Env):
         cache_dir: Reuse built scenarios (keyed by a hash of the spec) from this directory.
         sumo_extra: Extra SUMO arguments (e.g. ``["--seed", "7"]``).
         seed: Base seed. ``reset(seed=None)`` uses ``seed + episode index``; ``None`` leaves the scenario seed.
+        fidelity: Mobility federate (``"sumo"`` or ``"surrogate"``), or a callable ``episode_index -> fidelity`` (for
+            example :class:`mecosim.rl.schedule.FidelitySchedule`); ``None`` uses ``simulation.fidelity``.
     """
 
     metadata = {"render_modes": []}
@@ -115,6 +118,7 @@ class MecosimEnv(gym.Env):
         cache_dir: str | Path | None = None,
         sumo_extra: list[str] | None = None,
         seed: int | None = None,
+        fidelity: str | Callable[[int], str] | None = None,
     ) -> None:
         super().__init__()
         self.out_dir = absolute(out_dir)
@@ -142,6 +146,8 @@ class MecosimEnv(gym.Env):
         self._last_time_s = 0.0
         self.reward_weights = reward or RewardWeights()
         self.sumo_backend = sumo_backend
+        self.fidelity = fidelity
+        self.current_fidelity = self.built.spec.simulation.fidelity
         self.max_energy_kwh = float(max_energy_kwh)
         self.vehicle_ids = sorted(self.built.fleet)
         self.hub_ids = sorted(self.built.hubs)
@@ -166,10 +172,17 @@ class MecosimEnv(gym.Env):
         self._steps = 0
 
     # ------------------------------------------------------------------------------------------- helpers
+    def _next_fidelity(self) -> str:
+        """Fidelity of the episode about to start (a schedule may switch it, which forces a rebuild)."""
+        if self.fidelity is None:
+            return self.current_fidelity
+        return self.fidelity(self._episode) if callable(self.fidelity) else self.fidelity
+
     def _make(self, seed: int | None = None) -> None:
         from mecosim.runner import make_energy_driver, make_orchestrator
 
         self.close()
+        self.current_fidelity = self._next_fidelity()
         self.policy = ActionPolicy()
         run_dir = self.out_dir / ("run" if self.fast_reset else f"episode_{self._episode:04d}")
         options: dict[str, Any] = {}
@@ -185,6 +198,7 @@ class MecosimEnv(gym.Env):
             sumo_extra=self.sumo_extra or None,
             orchestrator_options=options,
             seed=seed,
+            fidelity=self.current_fidelity,  # type: ignore[arg-type]
         )
         self.orchestrator.manual_epochs = self.decision == "event"
         self.driver = make_energy_driver(self.built, horizon_s=self.orchestrator.config.horizon_s)
@@ -236,7 +250,12 @@ class MecosimEnv(gym.Env):
         self._episode += 1
         if seed is None and self.base_seed is not None:
             seed = self.base_seed + self._episode - 1
-        if self.fast_reset and self.orchestrator is not None:
+        if (
+            self.fast_reset
+            and self.orchestrator is not None
+            and hasattr(self.orchestrator.mobility, "rewind")  # the surrogate federate restarts instead
+            and self._next_fidelity() == self.current_fidelity
+        ):
             self.orchestrator.seed = self.built.spec.seed if seed is None else seed
         else:
             self._make(seed=seed)
@@ -279,6 +298,8 @@ class MecosimEnv(gym.Env):
         now = self.orchestrator.mobility.time_s
         info = {"time_s": now, "step": self._steps, "dt_s": now - self._last_time_s}
         self._last_time_s = now
+        if done:
+            info["episode_kpis"] = {**totals, "passenger_delay_s": delay, "fidelity": self.current_fidelity}
         if done and not self.fast_reset:
             self.close()
         return obs, float(reward), done, False, info
