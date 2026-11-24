@@ -239,7 +239,7 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
         out,
     )
     route_files = [fleet_file, person_file]
-    if spec.demand.background_period_s:
+    if spec.demand.background_period_s and spec.demand.background_mode == "full":
         bg_file = out / "background.trips.xml"
         _run(
             [
