@@ -31,6 +31,19 @@ from mecosim.scenarios.spec import ScenarioSpec
 __all__ = ["RunResult", "reference_backend", "make_orchestrator", "run_scenario", "resolve_timing_owner"]
 
 
+#: Metrics that need SUMO's tripinfo/statistics output (not written with ``simulation.profile: train``).
+_TRIPINFO_METRICS = (
+    "mean_person_travel_time_s",
+    "mean_person_wait_s",
+    "mean_ride_time_s",
+    "background_completed",
+    "background_throughput_veh_per_h",
+    "background_mean_travel_time_s",
+    "background_mean_time_loss_s",
+    "passenger_delay_per_trip_s",
+)
+
+
 def resolve_timing_owner(spec: ScenarioSpec) -> str:
     """``energy.timing_owner`` with ``"auto"`` resolved: CityLearn with session dynamics -> ``"energy_model"``."""
     owner = spec.energy.timing_owner
@@ -117,7 +130,7 @@ def make_orchestrator(
 ) -> Orchestrator:
     spec = built.spec
     sim = spec.simulation
-    clock = Clock(sim.master_step_s, sim.mobility_step_s, sim.begin_s, sim.decision_period_s)
+    clock = Clock(sim.master_step_s, sim.mobility_step_s, sim.episode_begin_s, sim.decision_period_s)
     conn = SumoConnectionConfig(
         args=built.sumo_args(output_dir, sumo_extra),
         backend=sumo_backend,
@@ -127,9 +140,15 @@ def make_orchestrator(
         port=port,
         binary=sumo_binary,
     )
+    opts = dict(orchestrator_options or {})
     fed = SumoFederate(
         SumoFederateConfig(
-            connection=conn, step_length_s=sim.mobility_step_s, output_dir=output_dir, routing_vtype="av_taxi"
+            connection=conn,
+            step_length_s=sim.mobility_step_s,
+            output_dir=output_dir,
+            routing_vtype="av_taxi",
+            mode=sim.mode,
+            state_file=output_dir / "warm_state.sbx" if opts.get("rewind_on_reset") and sim.warmup_s > 0 else None,
         ),
         built.fleet,
         built.hubs,
@@ -141,7 +160,7 @@ def make_orchestrator(
         "timing_owner": resolve_timing_owner(spec),
         "max_passenger_delay_s": spec.demand.max_passenger_delay_s,
         "energy_transfer": spec.energy.transfer,
-        **dict(orchestrator_options or {}),
+        **opts,
     }
     cfg = OrchestratorConfig(**cfg_kwargs)
     return Orchestrator(
@@ -196,9 +215,17 @@ def run_scenario(
             built.fleet,
             orch.sessions.values(),
             built.hubs,
-            end_s=sim.begin_s + sim.duration_s,
+            end_s=sim.episode_begin_s + sim.duration_s,
+            begin_s=sim.episode_begin_s,
         )
     )
+    if sim.profile == "train":
+        # No tripinfo/statistics in the training profile: keep what the federate counted, mark the rest unavailable.
+        for key in _TRIPINFO_METRICS:
+            metrics[key] = math.nan
+        arrived = float(len(getattr(orch.mobility, "arrived_persons", [])))
+        metrics["persons_completed"] = arrived
+        metrics["throughput_trips_per_h"] = arrived / (sim.duration_s / 3600.0)
     cap = sum(v.capacity_kwh for v in built.fleet.values())
     hub_throughput = sum(abs(s.measured_battery_kwh) for s in orch.sessions.values())
     driving_kwh = sum(max(0.0, st.consumed_kwh) for st in final_states.values())
