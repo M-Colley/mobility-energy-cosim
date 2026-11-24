@@ -28,6 +28,8 @@ DEFAULT_WELFARE_WEIGHTS: dict[str, float] = {
     "passenger_delay_energy_stops_s": -15.0 / 3600.0,  # value of time 15 currency/h
     "throughput_trips_per_h": 0.0,
     "equivalent_full_cycles": -0.0,
+    "fleet_energy_change_kwh": 0.0,  # terminal battery valuation (currency per kWh retained)
+    "unserved_energy_kwh": -0.0,  # value of lost load during supply/outage events
 }
 
 

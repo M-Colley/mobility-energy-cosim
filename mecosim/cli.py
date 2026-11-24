@@ -1,4 +1,5 @@
-"""Command-line interface: ``mecosim run``, ``mecosim sweep``, ``mecosim build``, ``mecosim info``."""
+"""Command-line interface: ``run``, ``sweep``, ``build``, ``calibrate``, ``train-rl``, ``train-env``, ``replay``,
+``pareto-html``, ``ukri-report``, ``export-citylearn``, ``info``."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ import yaml
 from mecosim import __version__
 from mecosim.paths import absolute
 
-__all__ = ["main"]
+__all__ = ["main", "build_parser"]
 
 
 def _parse_params(items: list[str]) -> dict[str, object]:
@@ -36,21 +37,31 @@ def _cmd_run(args: argparse.Namespace) -> int:
     spec = ScenarioSpec.from_yaml(args.scenario)
     if args.set:
         spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
-    res = run_scenario(spec, args.policy, _parse_params(args.param or []), out_dir=args.out, sumo_backend=args.backend)
+    res = run_scenario(
+        spec,
+        args.policy,
+        _parse_params(args.param or []),
+        out_dir=args.out,
+        sumo_backend=args.backend,
+        replay_html=bool(args.replay_html),
+    )
     keys = [
         "grid_import_kwh",
         "emissions_kg",
         "peak_import_kw",
         "zone_deficit_served_kwh",
+        "unserved_energy_kwh",
+        "outage_relief_kwh",
         "delivered_kwh_measured",
         "throughput_trips_per_h",
         "mean_person_wait_s",
         "passenger_delay_per_trip_s",
         "background_mean_time_loss_s",
         "energy_delivery_vkm",
+        "fleet_energy_change_kwh",
         "welfare",
     ]
-    print(json.dumps({k: res.metrics.get(k) for k in keys}, indent=2))
+    print(json.dumps({k: res.metrics.get(k) for k in keys if k in res.metrics}, indent=2))
     print(f"outputs: {res.output_dir}")
     return 0
 
@@ -82,7 +93,7 @@ def _cmd_sweep(args: argparse.Namespace) -> int:
         cols = ["label", "policy"] + [c for c in summary.columns if c.startswith("param.")] + list(cfg.objectives)
         cols = [c for c in cols if c in summary.columns]
         print(summary[cols].to_string(index=False))
-    if "pareto" in frames:
+    if "pareto" in frames and summary is not None:
         print(f"\nPareto set: {len(frames['pareto'])} of {len(summary)} configurations")
     print(f"outputs: {absolute(args.out)}")
     return 0
@@ -99,6 +110,155 @@ def _cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_train_rl(args: argparse.Namespace) -> int:
+    from mecosim.policies.rl import PPOConfig, train_rl_policy
+    from mecosim.scenarios.spec import ScenarioSpec
+
+    spec = ScenarioSpec.from_yaml(args.scenario)
+    if args.set:
+        spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
+    cfg = PPOConfig(
+        bc_episodes=args.bc_episodes,
+        bc_epochs=args.bc_epochs,
+        ppo_episodes=args.ppo_episodes,
+        ppo_epochs=args.ppo_epochs,
+        seed=args.seed,
+    )
+    _, hist = train_rl_policy(
+        spec,
+        out_checkpoint=args.out,
+        config=cfg,
+        work_dir=args.work_dir,
+        sumo_backend=args.backend,
+    )
+    print(
+        json.dumps(
+            {
+                "checkpoint": str(absolute(args.out)),
+                "bc_loss_final": hist.bc_losses[-1] if hist.bc_losses else None,
+                "ppo_returns": hist.episode_returns,
+                "eval_welfare": hist.episode_welfare[-1] if hist.episode_welfare else None,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    from mecosim.viz.replay import render_replay_html
+
+    src = Path(args.source)
+    out = Path(args.out) if args.out else (src / "replay.html" if src.is_dir() else src.with_suffix(".html"))
+    written = render_replay_html(src, out)
+    print(f"replay html: {absolute(written)}")
+    return 0
+
+
+def _cmd_pareto_html(args: argparse.Namespace) -> int:
+    from mecosim.viz.pareto_html import render_pareto_html
+
+    src = Path(args.sweep_dir)
+    out = Path(args.out) if args.out else (src / "pareto.html")
+    written = render_pareto_html(src, out)
+    print(f"pareto html: {absolute(written)}")
+    return 0
+
+
+def _cmd_ukri_report(args: argparse.Namespace) -> int:
+    from mecosim.uk_v2x.evidence import DEFAULT_UK_SEASONS, generate_ukri_evidence_pack
+
+    seasons = tuple(s.strip() for s in args.seasons.split(",") if s.strip()) if args.seasons else DEFAULT_UK_SEASONS
+    evidence = generate_ukri_evidence_pack(
+        args.scenario,
+        args.out,
+        policy=args.policy,
+        seasons=seasons,
+        sumo_backend=args.backend,
+        render_html=not args.no_html,
+    )
+    scale = evidence.get("uk_2gw_scale_up", {})
+    print(
+        json.dumps(
+            {
+                "seasons_evaluated": evidence["seasons_evaluated"],
+                "task53_pass_rate_pct": evidence["task53_interoperability"]["pass_rate_pct"],
+                "firm_p90_kw_per_ev": scale.get("effective_kw_per_enrolled_ev", {}).get("p90_firm_kw"),
+                "evs_needed_for_2gw_p90": scale.get("uk_2030_scale_up", {}).get("enrolled_v2x_evs_for_target_p90_firm"),
+                "output_dir": str(absolute(args.out)),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _seed_list(text: str) -> list[int]:
+    """``1,2,5`` or ``1-5``."""
+    out: list[int] = []
+    for part in text.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            out += list(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    from mecosim.calibration import calibrate, calibration_path
+    from mecosim.scenarios.spec import ScenarioSpec
+
+    spec = ScenarioSpec.from_yaml(args.scenario)
+    if args.set:
+        spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
+    cache = absolute(args.cache) if args.cache else None
+    cal = calibrate(spec, _seed_list(args.seeds), cache, jobs=args.jobs, force=args.force, out=args.out)
+    target = absolute(args.out) if args.out else calibration_path(spec, cache)
+    print(
+        json.dumps(
+            {
+                "calibration": str(target),
+                "seeds": cal.seeds,
+                "kwh_per_km": round(cal.kwh_per_km, 4),
+                "leg_overhead_s": round(cal.leg_overhead_s, 2),
+                "junction_s": round(cal.junction_s, 2),
+                **cal.meta,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _cmd_train_env(args: argparse.Namespace) -> int:
+    from mecosim.rl.train import run_cli
+    from mecosim.scenarios.spec import ScenarioSpec
+
+    spec = ScenarioSpec.from_yaml(args.scenario)
+    if args.set:
+        spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
+    out = absolute(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    print(json.dumps(run_cli(args, spec, out), indent=2))
+    return 0
+
+
+def _cmd_export_citylearn(args: argparse.Namespace) -> int:
+    from mecosim.export.citylearn import export_citylearn
+    from mecosim.scenarios.spec import ScenarioSpec
+
+    spec = ScenarioSpec.from_yaml(args.scenario)
+    if args.set:
+        spec = spec.with_overrides({k: v for k, v in (_split(s) for s in args.set)})
+    seeds = [int(x) for x in args.seeds.split(",")]
+    for path in export_citylearn(
+        spec, args.policy, seeds, args.out, _parse_params(args.param or []), sumo_backend=args.backend
+    ):
+        print(path)
+    return 0
+
+
 def _cmd_info(_: argparse.Namespace) -> int:
     from mecosim.policies import POLICIES
 
@@ -109,6 +269,10 @@ def _cmd_info(_: argparse.Namespace) -> int:
         info["sumo"] = version("eclipse-sumo")
     except PackageNotFoundError:
         info["sumo"] = None
+    try:
+        info["v2x_interop"] = version("v2x-interop")
+    except PackageNotFoundError:
+        info["v2x_interop"] = None
     try:
         import inspect
 
@@ -147,6 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--set", action="append", help="scenario override key=value, e.g. fleet.n_vehicles=8")
     r.add_argument("--out", default="output/run")
     r.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
+    r.add_argument("--replay-html", action="store_true", help="also write interactive replay.html")
     r.set_defaults(func=_cmd_run)
 
     s = sub.add_parser("sweep", help="policy x parameter sweep with Pareto analysis")
@@ -165,6 +330,77 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("scenario")
     b.add_argument("--out", default="output/scenario")
     b.set_defaults(func=_cmd_build)
+
+    trl = sub.add_parser("train-rl", help="train RLDeliveryPolicy via BC warm-start + PPO")
+    trl.add_argument("scenario", help="scenario YAML")
+    trl.add_argument("--out", default="output/rl_policy.json", help="output JSON weights file")
+    trl.add_argument("--work-dir", default="output/train_rl", help="rollout working directory")
+    trl.add_argument("--bc-episodes", type=int, default=2)
+    trl.add_argument("--bc-epochs", type=int, default=25)
+    trl.add_argument("--ppo-episodes", type=int, default=4)
+    trl.add_argument("--ppo-epochs", type=int, default=4)
+    trl.add_argument("--seed", type=int, default=0)
+    trl.add_argument("--set", action="append", help="scenario override key=value")
+    trl.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
+    trl.set_defaults(func=_cmd_train_rl)
+
+    rep = sub.add_parser("replay", help="generate interactive HTML5 replay from a run directory or replay.json")
+    rep.add_argument("source", help="run directory or replay.json path")
+    rep.add_argument("--out", help="output HTML path (default: <source>/replay.html)")
+    rep.set_defaults(func=_cmd_replay)
+
+    ph = sub.add_parser("pareto-html", help="generate interactive HTML5 Pareto & welfare explorer from a sweep folder")
+    ph.add_argument("sweep_dir", help="sweep output directory containing summary.csv")
+    ph.add_argument("--out", help="output HTML path (default: <sweep_dir>/pareto.html)")
+    ph.set_defaults(func=_cmd_pareto_html)
+
+    uk = sub.add_parser(
+        "ukri-report",
+        help="run multi-seasonal UK V2X co-simulations + Task 53 interop matrix & 2 GW scale-up HTML pack",
+    )
+    uk.add_argument("scenario", help="scenario YAML (e.g. examples/uk_v2x_2030_demo/scenario.yaml)")
+    uk.add_argument("--policy", default="optimized")
+    uk.add_argument(
+        "--seasons", help="comma-separated UK seasons (default: winter_peak,summer_solar,autumn_wind,storm_outage)"
+    )
+    uk.add_argument("--out", default="output/ukri_report")
+    uk.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
+    uk.add_argument("--no-html", action="store_true")
+    uk.set_defaults(func=_cmd_ukri_report)
+
+    c = sub.add_parser("calibrate", help="record speeds, consumption and stop timing from full SUMO runs")
+    c.add_argument("scenario")
+    c.add_argument("--seeds", default="1,2,3", help="calibration seeds, e.g. 1,2,3 or 1-5")
+    c.add_argument("--jobs", type=int, default=1, help="parallel processes")
+    c.add_argument("--set", action="append", help="scenario override key=value")
+    c.add_argument("--cache", help="cache directory (default: $MECOSIM_CACHE or output/calibration)")
+    c.add_argument("--out", help="calibration file (default: <cache>/<scenario hash>/calibration.npz)")
+    c.add_argument("--force", action="store_true", help="rerun cached seeds")
+    c.set_defaults(func=_cmd_calibrate)
+
+    t = sub.add_parser(
+        "train-env", help="train PPO (Stable-Baselines3) on MecosimEnv, optionally on a fidelity curriculum"
+    )
+    t.add_argument("scenario")
+    t.add_argument("--timesteps", type=int, default=6000, help="environment steps (one per master step)")
+    t.add_argument("--fidelity-schedule", help="episode mixture, e.g. surrogate:0.8,sumo:0.2")
+    t.add_argument("--train-fidelity", choices=["sumo", "surrogate"], help="single training fidelity")
+    t.add_argument("--eval-fidelity", choices=["sumo", "surrogate"], default="sumo")
+    t.add_argument("--eval-episodes", type=int, default=5)
+    t.add_argument("--seed", type=int, default=0)
+    t.add_argument("--set", action="append", help="scenario override key=value")
+    t.add_argument("--out", default="output/train_rl")
+    t.set_defaults(func=_cmd_train_env)
+
+    e = sub.add_parser("export-citylearn", help="run live once per seed and write plain CityLearn datasets")
+    e.add_argument("scenario", help="scenario YAML (energy.backend: citylearn)")
+    e.add_argument("--policy", default="no_delivery")
+    e.add_argument("--param", action="append", help="policy parameter key=value (dotted keys nest)")
+    e.add_argument("--set", action="append", help="scenario override key=value")
+    e.add_argument("--seeds", default="1", help="comma-separated seeds")
+    e.add_argument("--out", default="output/citylearn_export")
+    e.add_argument("--backend", choices=["libsumo", "traci"], default="libsumo")
+    e.set_defaults(func=_cmd_export_citylearn)
 
     i = sub.add_parser("info", help="versions and available policies")
     i.set_defaults(func=_cmd_info)

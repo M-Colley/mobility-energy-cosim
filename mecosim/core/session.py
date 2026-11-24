@@ -119,6 +119,14 @@ COUPLING_PRESETS: dict[str, SessionParameters] = {
     "wireless_j2954_assumed": SessionParameters(coupling_s=10.0, decoupling_s=0.0, name="wireless_j2954_assumed"),
     # ASSUMED: SAE J3105 pantograph: deployment/retraction 10 s each, start-up as the conductive median.
     "pantograph_j3105_assumed": SessionParameters(coupling_s=10.0, decoupling_s=10.0, name="pantograph_j3105_assumed"),
+    # ISO 15118-20 Plug & Charge + OCPP 2.1 remote setpoint delay (Watt et al. 2025 27 s; Zecchino et al. 2019 7 s).
+    "iso15118_20_plug_and_charge": SessionParameters(
+        coupling_s=18.0,
+        startup_s=27.0,
+        setpoint_delay_s=7.0,
+        decoupling_s=15.0,
+        name="iso15118_20_plug_and_charge",
+    ),
 }
 
 

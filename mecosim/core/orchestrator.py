@@ -19,7 +19,7 @@ session model's power profile (phases 2-6); the driver converts it into charger 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
@@ -52,6 +52,7 @@ from mecosim.core.protocols import (
 )
 from mecosim.core.reserve import ConsumptionEstimator, ReserveParameters, delivery_floor
 from mecosim.core.session import SessionModel, SessionParameters
+from mecosim.viz.replay import snapshot_observation
 
 __all__ = ["OrchestratorConfig", "ChargerTarget", "Orchestrator"]
 
@@ -85,6 +86,12 @@ class OrchestratorConfig:
         energy_transfer: ``"energy_model"`` (default; stock SUMO, station power 0, the energy model computes every
             transfer and mecosim writes the SOC to SUMO) or ``"sumo_native"`` (optional fast path for SUMO builds with
             native discharging: SUMO computes the discharge and the energy model receives the measured energy).
+        rewind_on_reset: ``reset`` on an already started orchestrator restarts the mobility simulator in place
+            (``mobility.rewind()``, warm state from ``mobility.snapshot()``) and clears the episode state, so one
+            orchestrator serves many episodes. Off: ``reset`` continues the running simulation (previous behaviour).
+        decision_mode: ``"fixed"`` (default) decides at the start of each master step and each ``decision_period_s``.
+            ``"event"`` decides at the start of each master step and whenever the mobility simulator reports a fleet
+            stop start/end, a passenger arrival or a new ride request (see :meth:`Orchestrator.advance_epoch`).
     """
 
     clock: Clock = field(default_factory=Clock)
@@ -99,6 +106,8 @@ class OrchestratorConfig:
     allow_dispatch_with_planned_stop: bool = True
     use_native_taxi_energy_stops: bool = False
     energy_transfer: Literal["energy_model", "sumo_native"] = "energy_model"
+    rewind_on_reset: bool = False
+    decision_mode: Literal["fixed", "event"] = "fixed"
 
     @property
     def horizon_steps(self) -> int:
@@ -146,6 +155,7 @@ class Orchestrator:
         self.seed = seed
         self.policy_options = dict(policy_options or {})
         self.log = EventLog()
+        self.frames: list[dict[str, Any]] = []
         self.backend: EnergyBackend | None = None
         self._mobility_started = False
         self.step = 0
@@ -167,6 +177,12 @@ class Orchestrator:
             or tuple(self.zones)
         )
         self._ev_to_vehicle = {spec.energy_id: vid for vid, spec in self.fleet.items()}
+        #: Mobility time added to ``clock.begin_s`` at the next ``reset`` (randomised episode start, set by the env).
+        self.start_offset_s = 0.0
+        #: ``decision_mode="event"``: ``update``/``reset`` stop at the first decision epoch; the caller drives
+        #: :meth:`advance_epoch`. Off: epochs run to the end of the interval inside ``update``.
+        self.manual_epochs = False
+        self._epochs: Generator[None, None, None] | None = None
 
     # =========================================================================================== provider API
     def bind(self, backend: EnergyBackend) -> None:
@@ -179,11 +195,27 @@ class Orchestrator:
             if env is None:
                 raise RuntimeError("no energy backend bound")
             self.backend = env
-        if not self._mobility_started:
+        first = not self._mobility_started
+        if first:
             self.mobility.start()
             self._mobility_started = True
-            if self.mobility.time_s < self.clock.begin_s:
-                self.mobility.advance(self.clock.begin_s)
+        elif self.config.rewind_on_reset and hasattr(self.mobility, "rewind"):
+            self.mobility.rewind()
+            self.log = EventLog()
+            self.consumption = ConsumptionEstimator(self.config.reserve)
+            self._session_counter = 0
+            self._states = {}
+            self._soc_at_step_start = {}
+        base = self.config.clock.begin_s
+        if self.mobility.time_s < base:
+            self.mobility.advance(base)
+        if first and self.config.rewind_on_reset and hasattr(self.mobility, "snapshot"):
+            self.mobility.snapshot()
+        self.clock = (
+            replace(self.config.clock, begin_s=base + self.start_offset_s) if self.start_offset_s else self.config.clock
+        )
+        if self.mobility.time_s < self.clock.begin_s:
+            self.mobility.advance(self.clock.begin_s)
         self.step = 0
         self._deferred.clear()
         self._written.clear()
@@ -198,6 +230,7 @@ class Orchestrator:
         self._targets.clear()
         self._connected_last.clear()
         self._soc_ref.clear()
+        self.frames.clear()
         context = PolicyContext(
             clock=self.clock,
             hubs=self.hubs,
@@ -212,13 +245,13 @@ class Orchestrator:
             efficiency_fn=lambda hid, vid, p, d: self.efficiency(hid, 0, vid, p, d),
         )
         self.policy.reset(context)
-        self._interval(0)
+        self._begin_interval(0)
 
     def update(self, env: Any, time_step: int) -> None:
         """``MobilityProvider.update``: called after the energy of ``[time_step-1, time_step)`` was computed."""
         self._reconcile()
         self.step = time_step
-        self._interval(time_step)
+        self._begin_interval(time_step)
 
     def finalize(self, env: Any = None) -> None:
         """``MobilityProvider.finalize``: reconcile the terminal interval's settled energy."""
@@ -239,11 +272,62 @@ class Orchestrator:
         self._reconcile()
 
     def close(self) -> None:
+        self._epochs = None
         if self._mobility_started:
             self.mobility.close()
             self._mobility_started = False
 
     # =========================================================================================== interval
+    def _begin_interval(self, t: int) -> None:
+        if self.config.decision_mode == "fixed":
+            self._interval(t)
+            return
+        self._epochs = self._interval_events(t)
+        if not self.manual_epochs:
+            while not self.advance_epoch():
+                pass
+        else:
+            self.advance_epoch()
+
+    def advance_epoch(self) -> bool:
+        """``decision_mode="event"``: run to the next decision epoch.
+
+        The first call of an interval (made by ``reset``/``update`` with ``manual_epochs``) stops at the start of the
+        interval, before the policy decided. Each further call lets the policy decide at the current epoch, applies the
+        commands and advances the mobility simulator until the next epoch. Returns ``True`` when the master interval
+        is complete (connections written, ready for the energy step), ``False`` when another epoch is pending.
+        """
+        if self._epochs is None:
+            raise RuntimeError("no interval in progress")
+        try:
+            next(self._epochs)
+        except StopIteration:
+            self._epochs = None
+            return True
+        return False
+
+    def _interval_events(self, t: int) -> Generator[None, None, None]:
+        start = self.clock.time_of(t)
+        end = self.clock.time_of(t + 1)
+        self._expire_planned(start)
+        self._soc_at_step_start = {}
+        first = True
+        while True:
+            yield  # decision epoch: the caller may set the policy's inputs before resuming
+            self._maintain_stops()
+            obs = self.observe(t)
+            if first:
+                for vid, st in obs.vehicles.items():
+                    self._soc_at_step_start[vid] = st.soc
+                    if st.in_simulation:
+                        self.consumption.update(vid, st.consumed_kwh, st.odometer_km)
+                first = False
+            self.apply(self.policy.decide(obs), obs)
+            self._handle_events(self.mobility.advance(end, stop_on_event=True))  # type: ignore[call-arg]
+            if self.mobility.time_s >= end - 1e-6:
+                break
+        self._write_connections(t, start, end)
+
     def _interval(self, t: int) -> None:
         start = self.clock.time_of(t)
         end = self.clock.time_of(t + 1)
@@ -255,10 +339,13 @@ class Orchestrator:
             self._maintain_stops()
             obs = self.observe(t)
             if k == 0:
+                self.frames.append(snapshot_observation(obs))
                 for vid, st in obs.vehicles.items():
                     self._soc_at_step_start[vid] = st.soc
                     if st.in_simulation:
-                        self.consumption.update(vid, st.consumed_kwh, st.odometer_km)
+                        self.consumption.update(
+                            vid, st.consumed_kwh, st.odometer_km, edge_id=st.edge_id, speed_mps=st.speed_mps
+                        )
             commands = self.policy.decide(obs)
             self.apply(commands, obs)
             events = self.mobility.advance(start + (k + 1) * epoch_len)
@@ -345,6 +432,7 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001 - simulator rejected the dispatch
             self.log.add("dispatch_rejected", t, vehicle=cmd.vehicle_id, reason=str(exc))
             return {"ok": False, "reason": str(exc)}
+        self._states.pop(cmd.vehicle_id, None)
         self.log.add("dispatch", t, vehicle=cmd.vehicle_id, reservations=",".join(cmd.reservation_ids))
         if planned is not None and planned.status == SessionStatus.PLANNED:
             # dispatchShared aborts all stops of the taxi: put the pending energy stop back (design section 4.1).
@@ -616,13 +704,17 @@ class Orchestrator:
             schedule(ev.vehicle_id, hub.station_id, ev.time_s + sess.planned_duration_s)
         if self._native_v2g and sess.direction == "discharge" and sess.floor_soc is not None:
             mob: Any = self.mobility
+            prm = self.session_model.params
             mob.native_v2g_begin(
                 ev.vehicle_id,
                 hub.station_id,
                 sess.power_kw,
                 sess.floor_soc,
                 efficiency=eta,
-                delay_s=self.session_model.params.ready_s,
+                delay_s=prm.ready_s,
+                ramp_up_kw_per_s=prm.ramp_up_kw_per_s,
+                ramp_down_kw_per_s=prm.ramp_down_kw_per_s,
+                stop_delay_s=prm.decoupling_s,
             )
             sess.meta["native"] = 1.0
             sess.meta["native_wh0"] = mob.native_total_discharged_wh(ev.vehicle_id)

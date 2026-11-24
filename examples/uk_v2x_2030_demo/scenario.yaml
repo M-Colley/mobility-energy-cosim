@@ -1,0 +1,132 @@
+# UKRI Competition 2613 ("Scaling Interoperable V2X: Bidirectional Charging") mixed-fleet UK demo.
+# Models 4 UK V2X archetypes (suburban V2H driveways, high-density residential kerbside hubs,
+# municipal LFP commercial depot vans, and road-going utility V2L emergency response EVs)
+# under UK winter peak Agile/DFS pricing, ENA G99/G100 LV feeder limits, and ISO 15118-20 / OCPP 2.1 arbitration.
+name: uk_v2x_2030_demo
+seed: 2030
+
+simulation:
+  begin_s: 0
+  duration_s: 7200       # 16:00 - 18:00 UK winter evening peak window
+  master_step_s: 300     # 5-minute settlement/dispatch epochs
+  mobility_step_s: 1.0
+  start_hour: 16.0
+
+network:
+  kind: grid
+  grid_number: 5
+  grid_length_m: 220.0
+  lanes: 1
+  speed_mps: 13.41       # 30 mph UK urban speed limit
+
+zones:
+  - id: suburban_v2h
+    role: pv_rich
+    x_range: [0.0, 0.34]
+    pv_scale: 1.4
+    pv_kwp: 65.0
+    load_kw_mean: 32.0
+  - id: kerbside_terraces
+    role: pv_poor
+    x_range: [0.34, 0.68]
+    pv_scale: 0.3
+    pv_kwp: 15.0
+    load_kw_mean: 58.0
+  - id: municipal_depot
+    role: pv_poor
+    x_range: [0.68, 1.0]
+    pv_scale: 0.6
+    pv_kwp: 30.0
+    load_kw_mean: 64.0
+
+hubs:
+  - id: driveway_v2h_hub
+    zone: suburban_v2h
+    plugs: 3
+    power_kw: 7.4        # 32 A UK single-phase domestic bidirectional AC/DC wallbox
+    curbside: false
+  - id: kerbside_street_hub
+    zone: kerbside_terraces
+    plugs: 3
+    power_kw: 11.0       # UK residential on-street public V2G post
+    curbside: true
+  - id: council_depot_hub
+    zone: municipal_depot
+    plugs: 3
+    power_kw: 22.0       # 3-phase / DC depot bidirectional V2B/V2G bays
+    curbside: false
+
+fleet_archetypes:
+  - id: dom_v2h
+    role: domestic_v2h
+    home_zone: suburban_v2h
+    n_vehicles: 2
+    capacity_kwh: 62.0
+    max_power_kw: 7.4
+    initial_soc: 0.82
+    chemistry: NMC811
+    minimum_soc: 0.25
+    target_soc: 0.80
+    maximum_soc: 0.95
+    transfer_mode: AC_single_phase
+  - id: kerb_pub
+    role: kerbside_public
+    home_zone: kerbside_terraces
+    n_vehicles: 2
+    capacity_kwh: 58.0
+    max_power_kw: 11.0
+    initial_soc: 0.78
+    chemistry: NMC811
+    minimum_soc: 0.25
+    target_soc: 0.80
+    maximum_soc: 0.95
+    transfer_mode: AC_three_phase
+  - id: depot_van
+    role: commercial_depot
+    home_zone: municipal_depot
+    n_vehicles: 2
+    capacity_kwh: 85.0
+    max_power_kw: 22.0
+    initial_soc: 0.85
+    chemistry: LFP
+    minimum_soc: 0.20
+    target_soc: 0.85
+    maximum_soc: 0.98
+    transfer_mode: DC
+  - id: util_v2l
+    role: utility_v2l
+    home_zone: municipal_depot
+    n_vehicles: 2
+    capacity_kwh: 95.0
+    max_power_kw: 22.0
+    initial_soc: 0.88
+    chemistry: LFP
+    minimum_soc: 0.20
+    target_soc: 0.85
+    maximum_soc: 0.98
+    transfer_mode: DC
+
+demand:
+  ride_period_s: 150.0
+  ride_min_distance_m: 440.0
+  max_passenger_delay_s: 600.0
+  background_period_s: 14.0
+
+energy:
+  backend: reference
+  timing_owner: mecosim
+
+session:
+  preset: iso15118_20_plug_and_charge
+
+uk_v2x:
+  enabled: true
+  season: winter_peak
+  enforce_protocols: true
+  transformer_rating_kva: 200.0
+  g100_import_limit_kw: 150.0
+  g100_export_limit_kw: 90.0
+  dso_product: Secure
+  dso_contracted_flex_kw: 25.0
+  driver_urgent_boost_prob: 0.02
+  comms_availability: 0.99

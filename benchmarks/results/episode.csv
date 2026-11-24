@@ -1,0 +1,9 @@
+variant,duration_s,master_steps,driver_build_s,episode_wall_s,sumo_advance_s,policy_decide_s,orchestrator_other_s,energy_backend_s,sim_s_per_wall_s
+base,1800.0,29,7.15,9.43,3.6,0.14,0.12,1.71,190.9
+no_background,1800.0,29,8.81,3.62,0.37,0.08,0.12,1.19,497.5
+sumo_step_5s,1800.0,29,17.04,11.0,4.35,0.03,0.12,2.23,163.6
+master_900s,1800.0,1,3.94,2.51,0.91,0.0,-0.43,0.13,716.8
+reference_energy,1800.0,29,0.01,8.17,4.63,0.1,0.12,0.06,220.4
+train_profile,1800.0,29,5.14,4.01,1.5,0.06,0.07,0.97,448.9
+city_reference,1800.0,29,0.02,53.68,37.2,1.27,-0.5,0.09,33.5
+city_reference_train,1800.0,29,0.0,20.45,17.89,0.65,0.02,0.05,88.0

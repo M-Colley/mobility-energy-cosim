@@ -1,0 +1,8 @@
+variant,episodes,env_steps,wall_s,env_steps_per_s,env_steps_per_cpu_s,sim_s_per_wall_s,ms_per_env_step
+demo_citylearn_eval,3,90,37.37,2.4,13.3,144.5,415.2
+demo_citylearn_train,3,90,12.59,7.1,14.8,428.8,139.9
+demo_reference_train,3,90,29.04,3.1,18.8,186.0,322.6
+demo_citylearn_train_ctrl900,3,6,27.05,0.2,1.8,199.6,4508.7
+demo_reference_train_event,3,220,29.14,7.5,44.7,185.3,132.5
+city_reference_eval,3,90,56.85,1.6,1.9,95.0,631.7
+city_reference_train,3,90,274.87,0.3,1.9,19.6,3054.1

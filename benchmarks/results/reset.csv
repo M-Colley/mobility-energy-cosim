@@ -1,0 +1,7 @@
+variant,scenario,reset_median_s,reset_cpu_median_s,sumo_start_or_reload_median_s,energy_backend_median_s
+rebuild,demo,2.707,1.016,0.316,2.34
+fast,demo,0.355,0.266,0.256,0.078
+rebuild_warmup300,demo,1.847,1.266,0.215,1.424
+fast_warmup300,demo,0.565,0.375,0.456,0.089
+rebuild,city,1.086,0.453,0.458,0.11
+fast,city,0.622,0.422,0.474,0.012

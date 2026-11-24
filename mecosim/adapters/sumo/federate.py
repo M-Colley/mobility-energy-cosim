@@ -22,13 +22,22 @@ from pathlib import Path
 
 from mecosim.adapters.sumo.capabilities import SumoCapabilities, detect_capabilities
 from mecosim.adapters.sumo.connection import SumoConnection, SumoConnectionConfig, open_connection
-from mecosim.adapters.sumo.native_v2g import NATIVE_V2G_VAR, probe_native_v2g
+from mecosim.adapters.sumo.native_v2g import (
+    NATIVE_V2G_VAR,
+    configure_native_session_ramps,
+    probe_native_session_ramps,
+    probe_native_v2g,
+)
 from mecosim.core.entities import Hub, RideRequest, VehicleSpec, VehicleState
 from mecosim.core.protocols import MobilityEvent
 
-__all__ = ["SumoFederateConfig", "SumoFederate", "NATIVE_V2G_VAR"]
+__all__ = ["SumoFederateConfig", "SumoFederate", "FleetVehicleLostError", "NATIVE_V2G_VAR"]
 
 _INVALID = -1e9
+
+
+class FleetVehicleLostError(RuntimeError):
+    """A fleet vehicle that was in the simulation is gone (SUMO removed it)."""
 
 
 @dataclass
@@ -43,6 +52,11 @@ class SumoFederateConfig:
         route_cache_s: Validity of cached routing estimates.
         routing_vtype: Vehicle type used for routing estimates (fleet type).
         stop_parking: Default ``parking`` flag of energy stops at off-street hubs.
+        mode: ``"micro"`` or ``"meso"`` (the SUMO arguments carry ``--mesosim``). In meso mode ``vehicle.isStopped``
+            (``getStopState`` is not implemented there) is replaced by the stop list, and a fleet vehicle that SUMO
+            removes raises :class:`FleetVehicleLostError`.
+        state_file: Where :meth:`SumoFederate.snapshot` saves the warm state that :meth:`SumoFederate.rewind`
+            restarts from (binary ``.sbx``).
     """
 
     connection: SumoConnectionConfig = field(default_factory=SumoConnectionConfig)
@@ -52,6 +66,10 @@ class SumoFederateConfig:
     route_cache_s: float = 300.0
     routing_vtype: str = ""
     stop_parking: bool = True
+    mode: str = "micro"
+    state_file: Path | None = None
+    #: Recorded edge speeds replayed instead of background traffic (``demand.background_mode: speed_field``).
+    speed_field: object | None = None
 
 
 class SumoFederate:
@@ -72,6 +90,8 @@ class SumoFederate:
         self._station_to_hub = {h.station_id: h.id for h in self.hubs.values()}
         self._station_meta: dict[str, tuple[str, float, float, float, float]] = {}
         self._route_cache: dict[tuple[str, str, int], tuple[float, float]] = {}
+        self._route_edges_cache: dict[tuple[str, str, int], list[tuple[str, float]]] = {}
+        self._edge_len_km: dict[str, float] = {}
         self._current_stop: dict[str, str] = {}
         self._ids: set[str] = set()
         self._ids_time = -1.0
@@ -82,6 +102,13 @@ class SumoFederate:
         self._scheduled_end: dict[str, tuple[float, str]] = {}
         self._native_discharged_wh: dict[str, float] = {}
         self._active_native_v2g: set[str] = set()
+        self._meso = self.config.mode == "meso"
+        self._fleet_seen: set[str] = set()
+        self._known_reservations: set[str] = set()
+        self._t_start = 0.0
+        self._warm_state = False
+        self._warm_time = 0.0
+        self._speed_field = None
 
     # ------------------------------------------------------------------------------------------- lifecycle
     @property
@@ -104,8 +131,18 @@ class SumoFederate:
         self.capabilities = detect_capabilities(
             self.conn.api, probe_station=probe_station, exceptions=self.conn.exceptions
         )
+        self._t_start = self.time_s
+        self._init_stations()
+
+    def _init_stations(self) -> None:
         self._station_meta.clear()
         self._active_native_v2g.clear()
+        if self.config.speed_field is not None:
+            from mecosim.adapters.sumo.speed_field import SpeedFieldController
+
+            self._speed_field = SpeedFieldController(self.config.speed_field)
+            self._speed_field.start(self.api)
+            self._speed_field.apply(self.api, self.time_s)
         for hub in self.hubs.values():
             if self.config.zero_station_power:
                 self.api.chargingstation.setChargingPower(hub.station_id, 0.0)
@@ -124,6 +161,45 @@ class SumoFederate:
             self.conn.close()
             self.conn = None
 
+    def snapshot(self) -> bool:
+        """Save the current state as the warm state of :meth:`rewind` (only after a warm-up, with ``state_file``)
+        and reload it.
+
+        ``simulation.loadState`` drops the not yet departed persons and vehicles of the route files (verified with SUMO
+        1.28), so the state is restored with ``--load-state`` at a SUMO reload instead.
+        """
+        path = self.config.state_file
+        if path is None or self.time_s <= self._t_start:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.api.simulation.saveState(str(path))
+        self._warm_state = True
+        self._warm_time = self.time_s
+        self.rewind()  # every episode, the first included, starts from the loaded state (the RNG is not saved in it)
+        return True
+
+    def rewind(self) -> None:
+        """Reload the simulation in place at its initial state (the warm state when saved) and reset the per-episode
+        state of the federate. This replaces closing and starting SUMO between episodes."""
+        if self.conn is None:
+            raise RuntimeError("SumoFederate not started")
+        args = list(self.config.connection.args)
+        if self._warm_state and self.config.state_file is not None:
+            args += ["--load-state", str(self.config.state_file), "--begin", repr(self._warm_time)]
+        self.conn.load(args)
+        self._route_cache.clear()
+        self._current_stop.clear()
+        self._ids = set()
+        self._ids_time = -1.0
+        self.arrived_persons = []
+        self.teleports = 0
+        self._pending_events.clear()
+        self._scheduled_end.clear()
+        self._native_discharged_wh.clear()
+        self._fleet_seen.clear()
+        self._known_reservations.clear()
+        self._init_stations()
+
     # ------------------------------------------------------------------------------------------- stepping
     def _refresh_ids(self) -> set[str]:
         t = self.time_s
@@ -132,13 +208,19 @@ class SumoFederate:
             self._ids_time = t
         return self._ids
 
-    def advance(self, until_s: float) -> list[MobilityEvent]:
-        """Step SUMO one step at a time up to ``until_s`` and collect fleet stop events (exact to one step)."""
+    def advance(self, until_s: float, stop_on_event: bool = False) -> list[MobilityEvent]:
+        """Step SUMO one step at a time up to ``until_s`` and collect fleet stop events (exact to one step).
+
+        With ``stop_on_event`` it returns right after the first step that produced a fleet stop event or a new open
+        ride request (decision epochs of ``decision: event``); the caller continues with another call.
+        """
         api = self.api
         events: list[MobilityEvent] = list(self._pending_events)
         self._pending_events.clear()
         eps = 1e-6
         while self.time_s < until_s - eps:
+            if self._speed_field is not None:
+                self._speed_field.apply(api, self.time_s)
             api.simulationStep()
             t = self.time_s
             events.extend(self._enforce_scheduled_ends(t))
@@ -168,7 +250,28 @@ class SumoFederate:
                 self.arrived_persons.append((t, pid))
                 events.append(MobilityEvent("person_arrived", t, persons=(pid,)))
             self.teleports += int(api.simulation.getStartingTeleportNumber())
+            if stop_on_event and (events or self._new_requests()):
+                break
+        if self._meso:
+            self._check_fleet()
         return events
+
+    def _new_requests(self) -> bool:
+        ids = {str(r.id) for r in self.api.person.getTaxiReservations(3)}
+        new = bool(ids - self._known_reservations)
+        self._known_reservations = ids
+        return new
+
+    def _check_fleet(self) -> None:
+        present = self._refresh_ids()
+        for vid in self.fleet:
+            if vid in present:
+                self._fleet_seen.add(vid)
+            elif vid in self._fleet_seen:
+                raise FleetVehicleLostError(
+                    f"fleet vehicle {vid!r} was removed by SUMO at t={self.time_s:.0f} s. The meso taxi device drops "
+                    "fleet taxis in SUMO builds without the fix; use simulation.mode: micro or a fixed SUMO build"
+                )
 
     # ------------------------------------------------------------------------------------------- vehicle state
     def _battery_wh(self, vid: str) -> float:
@@ -197,6 +300,14 @@ class SumoFederate:
         self._has_taxi[vid] = True
         return state
 
+    def _is_stopped(self, vid: str, stops: Sequence[object] | None = None) -> bool:
+        """``vehicle.isStopped``; in meso mode from the stop list (``getStopState`` is not implemented there)."""
+        if not self._meso:
+            return bool(self.api.vehicle.isStopped(vid))
+        if stops is None:
+            stops = self.api.vehicle.getStops(vid, 1)
+        return bool(stops) and stops[0].arrival >= 0 and stops[0].depart < 0  # type: ignore[attr-defined]
+
     def in_simulation(self, vid: str) -> bool:
         return vid in self._refresh_ids()
 
@@ -204,6 +315,8 @@ class SumoFederate:
         spec = self.fleet[vehicle_id]
         t = self.time_s
         if not self.in_simulation(vehicle_id):
+            if self._meso and vehicle_id in self._fleet_seen:
+                self._check_fleet()
             return VehicleState(vehicle_id, t, spec.initial_soc, spec.capacity_kwh, in_simulation=False)
         api = self.api
         cap_wh = self._capacity_wh(vehicle_id)
@@ -226,7 +339,7 @@ class SumoFederate:
             edge_id=edge,
             position=pos,
             speed_mps=float(api.vehicle.getSpeed(vehicle_id)),
-            stopped=bool(api.vehicle.isStopped(vehicle_id)),
+            stopped=self._is_stopped(vehicle_id, stops),
             persons=persons,
             taxi_state=self._taxi_state(vehicle_id),
             odometer_km=self._odometer(vehicle_id),
@@ -297,8 +410,8 @@ class SumoFederate:
         api = self.api
         tc = self.conn.constants  # type: ignore[union-attr]
         flags = tc.STOP_CHARGING_STATION | (tc.STOP_PARKING if parking else 0)
-        stopped = bool(api.vehicle.isStopped(vehicle_id))
         stops = api.vehicle.getStops(vehicle_id)
+        stopped = self._is_stopped(vehicle_id, stops)
         upcoming = len(stops) - (1 if stopped else 0)
         has_task = self._taxi_state(vehicle_id) != 0 or api.vehicle.getPersonNumber(vehicle_id) > 0
         try:
@@ -378,7 +491,7 @@ class SumoFederate:
         SUMO does not list stops ended by ``resume`` in ``getStopEndingVehiclesIDList`` (verified with 1.28), so the
         event is synthesised here.
         """
-        if self.in_simulation(vehicle_id) and self.api.vehicle.isStopped(vehicle_id):
+        if self.in_simulation(vehicle_id) and self._is_stopped(vehicle_id):
             place = self._current_stop.pop(vehicle_id, "")
             self.api.vehicle.resume(vehicle_id)
             self._pending_events.append(
@@ -407,7 +520,7 @@ class SumoFederate:
             if t < te - 1e-6:
                 continue
             del self._scheduled_end[vid]
-            if not self.in_simulation(vid) or not self.api.vehicle.isStopped(vid):
+            if not self.in_simulation(vid) or not self._is_stopped(vid):
                 continue
             if self._current_stop.get(vid) != station:
                 continue
@@ -445,6 +558,13 @@ class SumoFederate:
         else:
             self.api.chargingstation._setCmd(NATIVE_V2G_VAR, station_id, "d", watts)
 
+    def native_session_ramps_available(self) -> bool:
+        """Detect native trapezoidal ramp/stop-delay support on SUMO ``chargingStation``."""
+        if not self.hubs:
+            return False
+        station = next(iter(self.hubs.values())).station_id
+        return probe_native_session_ramps(self.api, station, exceptions=self._exc)
+
     def native_v2g_begin(
         self,
         vehicle_id: str,
@@ -453,12 +573,11 @@ class SumoFederate:
         floor_soc: float,
         efficiency: float = 1.0,
         delay_s: float = 0.0,
+        ramp_up_kw_per_s: float = math.inf,
+        ramp_down_kw_per_s: float = math.inf,
+        stop_delay_s: float = 0.0,
     ) -> None:
-        """Let SUMO discharge ``vehicle_id`` at ``station_id`` down to ``floor_soc`` (sumo_api.md section 5).
-
-        The station's ``efficiency`` is set to the session's terminal-to-battery efficiency and its ``chargeDelay`` to
-        the zero-power time before transfer (coupling + start-up + set-point delay); SUMO's profile is rectangular.
-        """
+        """Let SUMO discharge ``vehicle_id`` at ``station_id`` down to ``floor_soc`` (sumo_api.md section 5)."""
         for other in self.fleet:
             if other != vehicle_id and other not in self._active_native_v2g and self.in_simulation(other):
                 try:
@@ -468,6 +587,14 @@ class SumoFederate:
         cap = self._capacity_wh(vehicle_id)
         self.api.chargingstation.setEfficiency(station_id, efficiency)
         self.api.chargingstation.setChargeDelay(station_id, delay_s)
+        configure_native_session_ramps(
+            self.api,
+            station_id,
+            ramp_up_kw_per_s=ramp_up_kw_per_s,
+            ramp_down_kw_per_s=ramp_down_kw_per_s,
+            stop_delay_s=stop_delay_s,
+            exceptions=self._exc,
+        )
         self._set_discharge_power(station_id, power_kw * 1000.0)
         eff = efficiency
         self.api.vehicle.setParameter(vehicle_id, "device.battery.minimumChargeLevel", repr(floor_soc * cap))
@@ -517,6 +644,40 @@ class SumoFederate:
             self._route_cache.clear()
         self._route_cache[key] = result
         return result
+
+    def route_edges(self, from_edge: str, to_edge: str) -> list[tuple[str, float]]:
+        """Fastest route as ``[(edge_id, length_km), ...]`` (empty if unreachable or trivial)."""
+        if not from_edge or not to_edge:
+            return []
+        if from_edge == to_edge:
+            km = self._edge_length_km(from_edge)
+            return [(from_edge, km)] if km > 0 else []
+        bucket = int(self.time_s // max(1.0, self.config.route_cache_s))
+        key = (from_edge, to_edge, bucket)
+        hit = self._route_edges_cache.get(key)
+        if hit is not None:
+            return hit
+        try:
+            stage = self.api.simulation.findRoute(from_edge, to_edge, vType=self.config.routing_vtype)
+            edges = [str(e) for e in stage.edges if not str(e).startswith(":")]
+            result = [(eid, self._edge_length_km(eid)) for eid in edges] if edges else []
+        except self._exc:
+            result = []
+        if len(self._route_edges_cache) > 50000:
+            self._route_edges_cache.clear()
+        self._route_edges_cache[key] = result
+        return result
+
+    def _edge_length_km(self, edge_id: str) -> float:
+        hit = self._edge_len_km.get(edge_id)
+        if hit is not None:
+            return hit
+        try:
+            km = max(0.0, float(self.api.lane.getLength(edge_id + "_0")) / 1000.0)
+        except self._exc:
+            km = 0.0
+        self._edge_len_km[edge_id] = km
+        return km
 
     def route_vehicle_to_hub(self, v: VehicleState, hub: Hub) -> tuple[float, float]:
         """Position-aware travel ``(time_s, length_km)`` from ``v`` to ``hub`` (accounts for passed stations)."""

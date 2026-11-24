@@ -134,12 +134,20 @@ def mobility_metrics(
     background_prefix: str = "bg",
     *,
     end_s: float | None = None,
+    begin_s: float = 0.0,
 ) -> dict[str, float]:
-    """Throughput, travel/waiting times, background-traffic time loss and energy-stop metrics."""
+    """Throughput, travel/waiting times, background-traffic time loss and energy-stop metrics.
+
+    Background vehicles that departed before ``begin_s`` (warm-up traffic) are not counted.
+    """
     vehicles, persons = parse_tripinfo(tripinfo)
     fleet = set(fleet_ids)
     hours = max(duration_s, 1e-9) / 3600.0
-    bg = [v for v in vehicles if str(v["id"]).startswith(background_prefix) and v["id"] not in fleet]
+    bg = [
+        v
+        for v in vehicles
+        if str(v["id"]).startswith(background_prefix) and v["id"] not in fleet and _f(v["depart"], 0.0) >= begin_s
+    ]
     done_persons = [p for p in persons if _f(p["duration"]) >= 0 and p["rides"]]
     m: dict[str, float] = {
         "persons_completed": float(len(done_persons)),

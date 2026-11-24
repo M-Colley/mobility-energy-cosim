@@ -93,6 +93,12 @@ class VehicleSpec:
     max_power_kw: float = 11.0
     initial_soc: float = 0.8
     ev_id: str | None = None
+    archetype: str = "ride_hail"
+    chemistry: Literal["NMC811", "LFP"] = "NMC811"
+    minimum_soc: float = 0.20
+    target_soc: float = 0.80
+    maximum_soc: float = 0.95
+    transfer_mode: Literal["AC_single_phase", "AC_three_phase", "DC"] = "AC_single_phase"
 
     @property
     def energy_id(self) -> str:

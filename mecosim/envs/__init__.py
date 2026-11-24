@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-__all__ = ["MecosimEnv", "MecosimParallelEnv", "RewardWeights", "ActionPolicy"]
+__all__ = [
+    "MecosimEnv",
+    "MecosimParallelEnv",
+    "RewardWeights",
+    "ActionPolicy",
+    "make_vector_env",
+    "rllib_env_creator",
+    "register_rllib_env",
+]
 
 
 def __getattr__(name: str):  # lazy: gymnasium/pettingzoo are optional
@@ -14,4 +22,8 @@ def __getattr__(name: str):  # lazy: gymnasium/pettingzoo are optional
         from mecosim.envs.pettingzoo_env import MecosimParallelEnv
 
         return MecosimParallelEnv
+    if name in ("make_vector_env", "rllib_env_creator", "register_rllib_env"):
+        from mecosim.envs import vector
+
+        return getattr(vector, name)
     raise AttributeError(name)

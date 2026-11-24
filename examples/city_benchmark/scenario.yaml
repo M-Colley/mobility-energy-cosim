@@ -1,0 +1,63 @@
+# City-scale benchmark for simulation speed: 12x12 grid (2.75 km square), 30 automated taxis, 4800 background vehicles
+# per hour, six hubs. Energy: the reference model (synthetic zone profiles), so the run measures mobility scaling.
+# Run it with CityLearn instead via `energy.backend: citylearn` (the `citylearn` block below is the demo's).
+name: city_benchmark
+seed: 1
+simulation:
+  begin_s: 0
+  duration_s: 3600
+  master_step_s: 60
+  mobility_step_s: 1.0
+  start_hour: 11
+network:
+  kind: grid
+  grid_number: 12
+  grid_length_m: 250
+  lanes: 1
+  speed_mps: 13.89
+zones:
+  - id: west
+    role: pv_rich
+    x_range: [0.0, 0.5]
+    pv_scale: 4.0
+    pv_kwp: 60
+    load_kw_mean: 16
+    buildings: [Building_1, Building_2, Building_3, Building_4, Building_5]
+  - id: east
+    role: pv_poor
+    x_range: [0.5, 1.0]
+    pv_scale: 0.0
+    pv_kwp: 0
+    load_kw_mean: 24
+    buildings: [Building_6, Building_7, Building_8, Building_9, Building_10, Building_11, Building_12, Building_13]
+hubs:
+  - {id: depot_west_a, zone: west, plugs: 4, power_kw: 11.0}
+  - {id: depot_west_b, zone: west, plugs: 4, power_kw: 11.0}
+  - {id: hub_east_a, zone: east, plugs: 2, power_kw: 11.0}
+  - {id: hub_east_b, zone: east, plugs: 2, power_kw: 11.0, curbside: true}
+  - {id: hub_east_c, zone: east, plugs: 2, power_kw: 11.0}
+  - {id: hub_east_d, zone: east, plugs: 2, power_kw: 11.0}
+fleet:
+  n_vehicles: 30
+  capacity_kwh: 60
+  max_power_kw: 11
+  initial_soc: 0.6
+demand:
+  ride_period_s: 30          # 120 ride requests per hour
+  ride_min_distance_m: 600
+  max_passenger_delay_s: 600
+  background_period_s: 0.75  # 4800 background vehicles per hour
+energy:
+  backend: reference
+  timing_owner: auto
+  carbon_kg_per_kwh: 0.25
+  price_per_kwh: 0.30
+  citylearn:
+    dataset: citylearn_challenge_2022_phase_all_plus_evs
+    start_time_step: 131
+session:
+  preset: robotic_conductive
+reserve:
+  prior_kwh_per_km: 0.2
+  uncertainty_factor: 1.2
+  safety_margin_soc: 0.05

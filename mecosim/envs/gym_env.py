@@ -1,9 +1,11 @@
 """Gymnasium environment (central controller) over the co-simulation.
 
-One environment step is one master (energy) step. The action chooses, per fleet vehicle, a hub (0 = no new stop)
-and the energy of that stop as a continuous value in kWh (design section 2.1: energy per stop is a decision
-variable). Hubs in PV-rich zones are charging stops, others delivery (discharge) stops. Passenger dispatch and the
-low-SOC rule come from :class:`mecosim.policies.BasePolicy`, so the agent learns the energy decisions.
+One environment step is one master (energy) step (``decision="fixed"``) or the time to the next decision epoch
+(``decision="event"``, semi-Markov: ``info["dt_s"]`` is the elapsed mobility time for ``gamma ** (dt_s / dt_ref)``
+discounting). The master step is ``control_step_s`` when given. The action chooses, per fleet vehicle, a hub (0 = no
+new stop) and the energy of that stop as a continuous value in kWh (design section 2.1: energy per stop is a
+decision variable). Hubs in PV-rich zones are charging stops, others delivery (discharge) stops. Passenger dispatch
+and the low-SOC rule come from :class:`mecosim.policies.BasePolicy`, so the agent learns the energy decisions.
 
 Reward (explicit weights): ``-(energy cost + carbon price x emissions) - value of time x passenger delay`` incurred
 in the step, plus ``value per kWh x deficit served`` when configured.
@@ -12,9 +14,10 @@ in the step, plus ``value per kWh x deficit served`` when configured.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import gymnasium as gym
 import numpy as np
@@ -25,7 +28,7 @@ from mecosim.core.orchestrator import Orchestrator
 from mecosim.core.protocols import Command, EnergyStop, FleetObservation
 from mecosim.paths import absolute
 from mecosim.policies.base import BasePolicy
-from mecosim.scenarios.build import BuiltScenario, build_scenario
+from mecosim.scenarios.build import BuiltScenario, build_scenario, build_scenario_cached
 from mecosim.scenarios.spec import ScenarioSpec
 
 __all__ = ["RewardWeights", "ActionPolicy", "MecosimEnv"]
@@ -86,6 +89,17 @@ class MecosimEnv(gym.Env):
         max_energy_kwh: Upper bound of the energy action per stop.
         reward: Reward weights.
         sumo_backend: ``"libsumo"`` (default) or ``"traci"``.
+        fast_reset: Keep the energy driver (CityLearn environment) and the SUMO process alive across episodes and
+            reset in place (SUMO reload with the saved warm state). Default: rebuild per episode.
+        control_step_s: Master (energy and control) step; overrides ``simulation.master_step_s`` (e.g. 900 or 3600).
+            ``duration_s`` must be a multiple of it.
+        decision: ``"fixed"``: one step per master step. ``"event"``: a step ends at the next decision epoch (fleet
+            stop start/end, passenger arrival, new ride request) or at the end of the master step, whichever is first.
+        cache_dir: Reuse built scenarios (keyed by a hash of the spec) from this directory.
+        sumo_extra: Extra SUMO arguments (e.g. ``["--seed", "7"]``).
+        seed: Base seed. ``reset(seed=None)`` uses ``seed + episode index``; ``None`` leaves the scenario seed.
+        fidelity: Mobility federate (``"sumo"`` or ``"surrogate"``), or a callable ``episode_index -> fidelity`` (for
+            example :class:`mecosim.rl.schedule.FidelitySchedule`); ``None`` uses ``simulation.fidelity``.
     """
 
     metadata = {"render_modes": []}
@@ -98,14 +112,42 @@ class MecosimEnv(gym.Env):
         max_energy_kwh: float = 10.0,
         reward: RewardWeights | None = None,
         sumo_backend: str = "libsumo",
+        fast_reset: bool = False,
+        control_step_s: float | None = None,
+        decision: Literal["fixed", "event"] = "fixed",
+        cache_dir: str | Path | None = None,
+        sumo_extra: list[str] | None = None,
+        seed: int | None = None,
+        fidelity: str | Callable[[int], str] | None = None,
     ) -> None:
         super().__init__()
         self.out_dir = absolute(out_dir)
-        self.built = (
-            scenario if isinstance(scenario, BuiltScenario) else build_scenario(scenario, self.out_dir / "scenario")
-        )
+        if control_step_s is not None:
+            if isinstance(scenario, BuiltScenario):
+                scenario = replace(
+                    scenario, spec=scenario.spec.with_overrides({"simulation.master_step_s": float(control_step_s)})
+                )
+            else:
+                scenario = scenario.with_overrides({"simulation.master_step_s": float(control_step_s)})
+        if isinstance(scenario, BuiltScenario):
+            self.built = scenario
+        elif cache_dir is not None:
+            # CityLearn's resampled data goes to ``built.out_dir``: keep it per environment, not in the shared cache.
+            self.built = replace(build_scenario_cached(scenario, cache_dir), out_dir=self.out_dir / "scenario")
+        else:
+            self.built = build_scenario(scenario, self.out_dir / "scenario")
+        if decision == "event" and self.built.spec.energy.backend == "citylearn":
+            # CityLearn accepts charger writes only inside its mobility callbacks (no pause mid-interval).
+            raise ValueError("decision='event' needs energy.backend='reference' (CityLearn cannot pause inside a step)")
+        self.fast_reset = bool(fast_reset)
+        self.decision = decision
+        self.sumo_extra = list(sumo_extra or [])
+        self.base_seed = seed
+        self._last_time_s = 0.0
         self.reward_weights = reward or RewardWeights()
         self.sumo_backend = sumo_backend
+        self.fidelity = fidelity
+        self.current_fidelity = self.built.spec.simulation.fidelity
         self.max_energy_kwh = float(max_energy_kwh)
         self.vehicle_ids = sorted(self.built.fleet)
         self.hub_ids = sorted(self.built.hubs)
@@ -130,19 +172,35 @@ class MecosimEnv(gym.Env):
         self._steps = 0
 
     # ------------------------------------------------------------------------------------------- helpers
+    def _next_fidelity(self) -> str:
+        """Fidelity of the episode about to start (a schedule may switch it, which forces a rebuild)."""
+        if self.fidelity is None:
+            return self.current_fidelity
+        return self.fidelity(self._episode) if callable(self.fidelity) else self.fidelity
+
     def _make(self, seed: int | None = None) -> None:
         from mecosim.runner import make_energy_driver, make_orchestrator
 
         self.close()
+        self.current_fidelity = self._next_fidelity()
         self.policy = ActionPolicy()
-        run_dir = self.out_dir / f"episode_{self._episode:04d}"
+        run_dir = self.out_dir / ("run" if self.fast_reset else f"episode_{self._episode:04d}")
+        options: dict[str, Any] = {}
+        if self.fast_reset:
+            options["rewind_on_reset"] = True
+        if self.decision == "event":
+            options["decision_mode"] = "event"
         self.orchestrator = make_orchestrator(
             self.built,
             self.policy,
             output_dir=run_dir,
             sumo_backend=self.sumo_backend,  # type: ignore[arg-type]
+            sumo_extra=self.sumo_extra or None,
+            orchestrator_options=options,
             seed=seed,
+            fidelity=self.current_fidelity,  # type: ignore[arg-type]
         )
+        self.orchestrator.manual_epochs = self.decision == "event"
         self.driver = make_energy_driver(self.built, horizon_s=self.orchestrator.config.horizon_s)
 
     def _observe(self) -> np.ndarray:
@@ -190,20 +248,42 @@ class MecosimEnv(gym.Env):
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):  # type: ignore[override]
         super().reset(seed=seed)
         self._episode += 1
-        self._make(seed=seed)
+        if seed is None and self.base_seed is not None:
+            seed = self.base_seed + self._episode - 1
+        if (
+            self.fast_reset
+            and self.orchestrator is not None
+            and hasattr(self.orchestrator.mobility, "rewind")  # the surrogate federate restarts instead
+            and self._next_fidelity() == self.current_fidelity
+        ):
+            self.orchestrator.seed = self.built.spec.seed if seed is None else seed
+        else:
+            self._make(seed=seed)
         assert self.orchestrator is not None
+        sim = self.built.spec.simulation
+        offset = 0.0
+        if sim.start_offset_max_s > 0:
+            offset = math.floor(self.np_random.uniform(0.0, sim.start_offset_max_s) / sim.mobility_step_s)
+            offset *= sim.mobility_step_s
+        self.orchestrator.start_offset_s = offset
         self.driver.reset(self.orchestrator)
         self._last_totals = self._totals()
         self._last_delay = 0.0
         self._steps = 0
-        return self._observe(), {}
+        self._last_time_s = self.orchestrator.mobility.time_s
+        return self._observe(), ({"start_offset_s": offset} if sim.start_offset_max_s > 0 else {})
 
     def step(self, action: dict[str, Any]):  # type: ignore[override]
         assert self.orchestrator is not None and self.policy is not None
         hubs = np.asarray(action["hub"], dtype=int)
         energy = np.clip(np.asarray(action["energy_kwh"], dtype=float), 0.0, self.max_energy_kwh)
         self.policy.pending = {vid: (int(hubs[i]), float(energy[i])) for i, vid in enumerate(self.vehicle_ids)}
-        done = bool(self.driver.step(self.orchestrator.charger_targets()))
+        if self.decision == "event":
+            done = False
+            if self.orchestrator.advance_epoch():
+                done = bool(self.driver.step(self.orchestrator.charger_targets()))
+        else:
+            done = bool(self.driver.step(self.orchestrator.charger_targets()))
         self._steps += 1
         totals = self._totals()
         delay = self._passenger_delay()
@@ -215,8 +295,12 @@ class MecosimEnv(gym.Env):
         ) + w.deficit_served_per_kwh * (totals["served"] - self._last_totals["served"])
         self._last_totals, self._last_delay = totals, delay
         obs = self._observe()
-        info = {"time_s": self.orchestrator.mobility.time_s, "step": self._steps}
+        now = self.orchestrator.mobility.time_s
+        info = {"time_s": now, "step": self._steps, "dt_s": now - self._last_time_s}
+        self._last_time_s = now
         if done:
+            info["episode_kpis"] = {**totals, "passenger_delay_s": delay, "fidelity": self.current_fidelity}
+        if done and not self.fast_reset:
             self.close()
         return obs, float(reward), done, False, info
 

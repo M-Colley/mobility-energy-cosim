@@ -64,10 +64,25 @@ pip install "citylearn @ git+https://github.com/M-Colley/CityLearn@feat/charger-
 pip install -e ".[dev]"                                 # or ".[rl,analysis]"
 mecosim info
 
-# one run
-mecosim run examples/two_zone_demo/scenario.yaml --policy optimized --out output/run
+# one run (pass --replay-html to also write a self-contained HTML5 replay viewer)
+mecosim run examples/two_zone_demo/scenario.yaml --policy optimized --replay-html --out output/run
 
-# the demo sweep (policies x delivery sizes x weights x epsilon budgets); CSV, Pareto set, plot
+# joint passenger + V2B + PV-charging MILP on the grid-outage mobile-microgrid demo
+mecosim run examples/outage_relief_demo/scenario.yaml --policy joint_optimized \
+  --param weights.unserved_penalty_per_kwh=5.0 --replay-html --out output/outage
+
+# native 15-minute Portuguese Renewable Energy Community (pt_rec_15 Parquet dataset)
+mecosim run examples/pt_rec_demo/scenario.yaml --policy optimized --out output/pt_rec
+
+# train the reserve-shielded RL policy (BC warm-start from OptimizedDelivery + clipped PPO)
+mecosim train-rl examples/two_zone_demo/scenario.yaml --out output/rl_policy.json
+mecosim run examples/two_zone_demo/scenario.yaml --policy rl --param checkpoint=output/rl_policy.json --out output/rl_eval
+
+# interactive HTML5 replay & Pareto/welfare explorers from existing outputs
+mecosim replay output/run --out output/run/replay.html
+mecosim pareto-html examples/two_zone_demo/output --out examples/two_zone_demo/output/pareto.html
+
+# the demo sweep (policies x delivery sizes x weights x epsilon budgets); CSV, Pareto set, plot + pareto.html
 python examples/two_zone_demo/run_demo.py --jobs 4
 # without CityLearn: the same scenario with the reference energy model and synthetic profiles
 python examples/two_zone_demo/run_demo.py --reference
@@ -184,18 +199,98 @@ Mean ± standard deviation over 3 seeds.
 
 ## Policies
 
-| Policy | Energy decision |
+| Policy | Energy & passenger decision |
 |---|---|
-| `no_delivery` | none (passenger service; recharge below 30 % SOC at the PV-rich depot) |
+| `no_delivery` | none (greedy passenger service; recharge below 30 % SOC at the PV-rich depot) |
 | `greedy_deficit` | idle vehicles deliver a fixed `delivery_kwh` to the zone with the largest forecast deficit; charge on PV surplus |
 | `opportunistic_mid_journey` | vehicles with passengers stop at a deficit hub on the way if detour and passenger delay stay within budgets (energy reduced to fit); idle vehicles as in `greedy_deficit` |
-| `optimized` | rolling-horizon MILP: where, when and how much to deliver; reserve, plugs, zone deficit cap, time budget, passenger maximum delay, optional ε-constraint on passenger delay; explicit objective weights |
+| `optimized` | rolling-horizon HiGHS MILP over V2B deliveries and co-optimised PV-surplus charging; trip reserve, shared hub plugs, zone deficit/surplus caps, passenger delay budgets, optional ε-constraint, explicit `terminal_soc_value_per_kwh` shadow price and `min_fleet_soc_delta_kwh` SOC-neutrality floor |
+| `joint_optimized` | unified rolling-horizon HiGHS MILP solving **passenger-to-taxi assignment** alongside V2B deliveries, PV-surplus charging, and ride-coupled en-route/post-dropoff V2B synergies |
+| `rl` | candidate-factored neural actor-critic (`RLDeliveryPolicy`) with exact trip-reserve safety projection, Behavioral Cloning warm-start from `OptimizedDelivery` and clipped PPO (`mecosim train-rl`) |
 | `random` | sanity baseline |
 
-All policies share the same passenger dispatch (nearest idle vehicle) and recharge rule, so they differ only in their
-energy decisions. PV-surplus top-ups are scheduled only when at most 25 % of the stop passes without energy flow
+Decoupled policies (`no_delivery`, `greedy_deficit`, `opportunistic_mid_journey`, `optimized`, `rl`, `random`) share `BasePolicy`'s greedy passenger dispatch so comparisons isolate the energy decision, while `joint_optimized` co-optimises passenger matching and energy dispatch in one MILP. PV-surplus top-ups are scheduled only when at most 25 % of the stop passes without energy flow
 (0.67 kWh at 11 kW; see docs/models.md); low-SOC recharging is never held back. Gymnasium (`mecosim.envs.MecosimEnv`) and PettingZoo (`MecosimParallelEnv`) environments expose the
 hub choice and the energy per stop (continuous, kWh) as actions; `mecosim.mosaik.MecosimSim` is a mosaik simulator.
+
+## Training speed
+
+All options are off by default (`MecosimEnv` keyword arguments and `simulation.*` keys); defaults give the previous
+results. Design details: [docs/architecture.md](docs/architecture.md#training-throughput-opt-in).
+`python benchmarks/rl_throughput.py [episode|reset|steps|vector|kpi]` reproduces the tables; raw CSVs are in
+`benchmarks/results/`.
+
+```python
+from mecosim.envs import MecosimEnv, make_vector_env
+
+env = MecosimEnv(spec, "output/rl", fast_reset=True, control_step_s=900, cache_dir="output/cache")
+vec = make_vector_env(spec, n_envs=8, seed=0)  # one libsumo and one CityLearn per spawned process
+```
+
+| Option | Effect |
+|---|---|
+| `fast_reset=True`, `simulation.warmup_s` | keep CityLearn and SUMO alive, reload SUMO in place from a saved warm state |
+| `simulation.start_offset_max_s` | random delay between warm-up end and master step 0 per episode (ride requests accumulate) |
+| `simulation.profile: train` | no tripinfo/statistics/stop/log output; `run_scenario` marks tripinfo metrics NaN |
+| `control_step_s`, `decision="event"` | master step 900/3600 s; semi-MDP steps at fleet events with `info["dt_s"]` (reference energy only) |
+| `make_vector_env`, `rllib_env_creator` | one process per environment, per-worker seeds |
+| `simulation.mode: meso` | `--mesosim`; needs a SUMO build that keeps fleet taxis (otherwise `FleetVehicleLostError`) |
+
+**Measurements.** The benchmark machine was shared with other heavy jobs (CPU load 100 %, disk and memory pressure),
+so wall times below are inflated and noisy; the CPU-time columns are the reliable ones. Two-zone demo, 1800 s,
+CityLearn energy, median of 5 resets:
+
+| `env.reset()` | wall (s) | CPU (s) | SUMO start/reload (s) | CityLearn and rest (s) |
+|---|---|---|---|---|
+| rebuild each episode (previous) | 2.71 | 1.02 | 0.32 | 2.34 |
+| `fast_reset` | 0.36 | 0.27 | 0.26 | 0.08 |
+| rebuild, `warmup_s=300` | 1.85 | 1.27 | 0.22 | 1.42 |
+| `fast_reset`, `warmup_s=300` | 0.57 | 0.38 | 0.46 | 0.09 |
+| city scenario (reference energy), rebuild / fast | 1.09 / 0.62 | 0.45 / 0.42 | 0.46 / 0.47 | 0.11 / 0.01 |
+
+The reset target of 100 ms is not reached. The SUMO reload (net and route files are parsed again) took 75 ms (plain)
+to 116 ms (warm state) on a quiet machine and 0.26 to 0.46 s under load; the reset also simulates the first 60 s master
+interval (about 60 ms), and CityLearn's own `env.reset()` (not modified) costs about 80 ms. `simulation.loadState` was
+tested and rejected: it drops all persons and vehicles that have not departed (SUMO 1.28), so the ride demand
+disappears. Fast reset reproduces episodes exactly (same actions give the same reward and observation; tested).
+
+| Environment steps (CPU time) | steps per CPU s |
+|---|---|
+| demo, CityLearn, eval profile | 13.9 |
+| demo, CityLearn, train profile | 14.8 |
+| demo, reference energy, train profile | 18.8 |
+| demo, reference energy, `decision="event"` (epochs) | 44.7 |
+| city 12x12, 30 taxis, 4800 bg veh/h, reference energy, eval / train | 1.9 / 1.9 |
+
+Where the time goes (cProfile, demo, 1800 s, reference energy, quiet machine): 0.53 s of 0.57 s in `advance` is SUMO's
+`simulation_step`; all TraCI getters of the observation, the policy and the per-step event queries sum to about 0.04
+s. Subscriptions would save under 0.1 ms per step, and one `simulationStep(until)` cannot see fleet events inside the
+jump, so neither was implemented. SUMO's step is the bound; the levers are fewer or cheaper SUMO steps (smaller network
+or demand, train profile, coarser `mobility_step_s`) and more processes. A quiet-machine A/B of one 1800 s episode gave
+1.02 s (eval) and 0.71 s (train), a single run each. `--routing-algorithm astar` and `--no-internal-links` change
+results and were rejected.
+
+| Vector env (demo, CityLearn, train profile; loaded machine) | env steps/s | sim s / wall s |
+|---|---|---|
+| 1 worker | 13.7 | 822 |
+| 2 workers | 28.7 | 1720 |
+| 4 workers | 23.1 | 1387 |
+| 8 workers | 30.3 | 1815 |
+
+Scaling beyond 2 workers could not be measured here (other jobs used the cores); rerun the `vector` experiment on an
+idle machine.
+
+**Master step 900 s versus 60 s** (demo, CityLearn, 3600 s, same policy parameters; deviation from the 60 s run):
+
+| Policy | Variant | Grid import | Deficit served | Charged | Energy stops | Mean wait |
+|---|---|---|---|---|---|---|
+| greedy_deficit | 900 s master, policy every 60 s | +8.4 % | -5.2 % | -23.5 % | 11 vs 12 | -14.2 % |
+| optimized | 900 s master, policy every 60 s | +6.2 % | -3.7 % | -27.8 % | 10 vs 10 | -9.3 % |
+| both | 900 s master, policy every 900 s | +160 % to +166 % | -100 % | -100 % | 0 | +469 % to +501 % |
+
+With the policy only at master steps (900 s) no vehicle is dispatched in time and no stop starts, so coarse energy
+steps need `simulation.decision_period_s: 60` (decisions every minute, energy every 900 s). Even then charged energy
+deviates by 24 to 28 % because stop timing and the minimum top-up rule are evaluated per master step.
 
 ## Mid-journey stops in SUMO
 
@@ -206,42 +301,74 @@ last drop-off, and turns an idle taxi's stop into an indefinite wait; mecosim wo
 after each dispatch, deferral until the taxi is idle, timed `resume`). See
 [docs/models.md, section 6](docs/models.md#6-mobility-side-sumo-taxi-device-and-energy-stops-stock-sumo).
 
+## Mobility fidelity levels
+
+SUMO dominates the cost of a master step. Two opt-in levels are cheaper: `demand.background_mode: speed_field` replaces the
+background vehicles with recorded per-edge speeds, and `simulation.fidelity: surrogate` replaces SUMO with a pure-Python
+event simulation of the fleet on the SUMO network. Both use a calibration from full SUMO runs (`mecosim calibrate`).
+`mecosim train-env --fidelity-schedule surrogate:0.8,sumo:0.2` trains PPO on a mixture of levels. Validation against full
+SUMO, speed and the sim-to-sim gap: [docs/fidelity.md](docs/fidelity.md).
+
 ## CARLA
 
 mecosim and CARLA's SUMO co-simulation bridge run as two TraCI clients of one SUMO in lockstep (`--num-clients 2`,
 `setOrder`), at the bridge's 0.05 s step. See [docs/carla.md](docs/carla.md). Lockstep is tested with a stub client
 that mimics the bridge; CARLA itself was not run.
 
+## Multiparty V2X standards, battery SOH & UK 2 GW flexibility pack (`v2x-interop` + `mecosim ukri-report`)
+
+Reusable standards and UK distribution-network primitives live in the standalone
+[`v2x-interop`](https://github.com/M-Colley/v2x-interop) package (`ISO 15118-20` Dynamic/Scheduled BPT envelopes,
+`OCPP 2.1` bidirectional `SetChargingProfile` wire codecs, `OpenADR 3.0` events, 5-party HMAC-authenticated session
+arbitration, the 12-case **IEA Task 53** interoperability matrix, `NMC811`/`LFP` battery SOH calendar-vs-driving-vs-V2X
+wear attribution, UK half-hourly seasonal Agile/DFS/NESO profiles, **ENA G99/G100** LV feeder envelopes with statutory
+230 V +10 %/−6 % voltage checks, UK DSO `Sustain`/`Secure`/`Dynamic`/`Restore` settlement, and Monte Carlo `P50`/`P90`
+extrapolation to the **UK 2030 2 GW Consumer-Led Flexibility** target across all 6 UK DNO groups).
+
+In `mecosim`, set `uk_v2x.enabled: true` and optional heterogeneous `fleet_archetypes` (`domestic_v2h`,
+`kerbside_public`, `commercial_depot`, `utility_v2l`, `ride_hail` — see `examples/uk_v2x_2030_demo/scenario.yaml`), or
+generate a full multi-seasonal evidence pack and interactive HTML5 explorer with one command:
+
+```bash
+mecosim ukri-report examples/uk_v2x_2030_demo/scenario.yaml --policy optimized --out output/ukri_2030
+```
+
 ## Limitations
 
 - **CARLA not run**: the integration follows CARLA's bridge source and is tested with a stub client only.
 - **CityLearn features unreleased**: requires the `feat/charger-session-dynamics` branch (external-mobility hook plus
   session dynamics); CI installs it from git.
-- **Data resolution**: CityLearn datasets are hourly; mecosim holds intensive values and splits energies within each
-  hour (hourly totals preserved, no intra-hour variability). Zones are energy communities without internal grid
-  constraints. Zone-deficit forecasts handed to policies use a nominal COP of 3 for thermal demand.
+- **Data resolution & grid outages**: hourly CityLearn datasets hold intensive values and split energies within each
+  hour, while native sub-hourly CSV/Parquet datasets (e.g. 15-minute `pt_rec_*` communities in `examples/pt_rec_demo`
+  and 15-second three-phase datasets) are sliced, sub-stepped or aggregated directly. Zone-level feeder import caps and
+  scheduled blackouts are supported via `energy.outages` (`examples/outage_relief_demo`), reporting
+  `unserved_energy_kwh` and `outage_relief_kwh`. Zone-deficit forecasts use a nominal COP of 3 for thermal demand.
 - **Stock SUMO taxi device** drops energy stops on re-dispatch and after the last drop-off, and its `stop` idle
   algorithm forces `STOP_TRIGGERED | STOP_PARKING` onto idle taxis' stops (so curbside lane blocking in stock SUMO
   takes effect on mid-journey stops); the workaround re-inserts stops after each dispatch, delays post-drop-off stops
   until the taxi is idle and ends idle stops on time with `resume`. A native fix (SUMO branch `taxi-energy-stops`, refs
   eclipse-sumo/sumo#15586) is detected but off by default.
-- **Native SUMO V2G** (fast path) needs an unreleased SUMO build; it is off by default and uses a rectangular power
-  profile with `chargeDelay` (no ramps).
-- **Assumed values**: the wireless and pantograph coupling presets, the consumption prior (0.20 kWh/km), the reserve
-  margin and factor, and all objective and welfare weights are assumptions; sweep them.
+- **Native SUMO V2G** (fast path) needs an unreleased SUMO build; it is off by default (`energy.transfer: energy_model`)
+  and automatically configures trapezoidal `chargeRampUp`, `chargeRampDown` and `chargeStopDelay` when supported by the
+  connected SUMO build, falling back to `chargeDelay` on rectangular builds.
+- **Assumed values & adaptive reserve**: the wireless and pantograph coupling presets, the default consumption prior
+  (0.20 kWh/km), and objective/welfare weights are configurable assumptions; enable online per-edge Bayesian + UCB
+  consumption learning via `reserve.adaptive_ucb_z` and `reserve.edge_prior_km` (`AdaptiveConsumptionEstimator`).
 - **Timing**: by default CityLearn's charger session dynamics apply the stop timing (start delay, set-point delay,
   ramps, stop delay) with mecosim's cited parameters; mecosim plans stop durations with the same semantics and passes
   the exact departure (`departure_seconds`). Measured agreement with the plan: deliveries below 0.0001 %, charges at
   most +0.0001 Wh. With CityLearn versions without `departure_seconds` the stop instant is known only in the departure
   step: deliveries stay within ±0.13 % (discharge floor), charges overshoot by up to 62 Wh. Without session dynamics
   (`timing_owner: mecosim`) the measured energy of a delivery is within 1 % of the request.
-- **No terminal-SOC valuation**: the objectives do not value the fleet's energy at the end of the horizon, so policies
-  that discharge without recharging (e.g. `random` in the demo) look better than they are; compare charged and
-  delivered energy, or extend the horizon.
+- **Terminal-SOC valuation**: by default `terminal_soc_value_per_kwh` is `0.0` (so horizon-myopic policies such as
+  `random` in the demo can draw down fleet SOC); set `weights.terminal_soc_value_per_kwh > 0`,
+  `min_fleet_soc_delta_kwh=0.0` (SOC-neutrality floor) or `welfare_weights["fleet_energy_change_kwh"]` to value
+  retained battery energy explicitly.
 - **Zone netting**: benefits depend on zones being separate energy communities or feeders; with a fully netted district
   the demo's PV-rich zone would cover the PV-poor zone without any vehicle.
 - PettingZoo agents are vehicles only (no hub or building agents); building control stays with CityLearn's controller.
 - libsumo runs one SUMO per process; sweeps use processes (`--jobs`).
+- `speed_field` and `surrogate` do not model the fleet's effect on background traffic (for example curbside stops); see [docs/fidelity.md](docs/fidelity.md).
 
 ## Development
 

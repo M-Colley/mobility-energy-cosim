@@ -65,6 +65,7 @@ class SchemaPatch:
     remove_existing_evs: bool = True
     extra_building_attributes: dict[str, dict[str, Any]] = field(default_factory=dict)
     session_dynamics: SessionParameters | None = None
+    upgrade_hub_electrical_service: bool = True
 
 
 def assign_buildings(schema: Mapping[str, Any], zones: Sequence[Zone], per_zone: int) -> dict[str, list[str]]:
@@ -142,6 +143,24 @@ def patch_schema(
                     **(charger_dynamics_attributes(opt.session_dynamics) if opt.session_dynamics else {}),
                 },
             }
+        bdef_hub = s["buildings"][building]
+        esvc = bdef_hub.get("electrical_service")
+        if opt.upgrade_hub_electrical_service and isinstance(esvc, dict) and esvc:
+            # Commercial fleet hub connection: ensure residential single-phase L2=0/L3=0 limits do not clamp V2G hubs.
+            total_hub_kw = sum(float(c.get("attributes", {}).get("max_charging_power", 0.0)) for c in chargers.values())
+            needed_kw = max(25.0, total_hub_kw * 1.25)
+            limits = esvc.setdefault("limits", {})
+            tot = limits.setdefault("total", {})
+            tot["import_kw"] = max(float(tot.get("import_kw") or 0.0), needed_kw)
+            tot["export_kw"] = max(float(tot.get("export_kw") or 0.0), needed_kw)
+            if str(esvc.get("mode", "")).lower() == "three_phase":
+                esvc["default_split"] = "balanced"
+                per_phase = limits.setdefault("per_phase", {})
+                phase_kw = needed_kw / 3.0
+                for ph in ("L1", "L2", "L3"):
+                    pdict = per_phase.setdefault(ph, {})
+                    pdict["import_kw"] = max(float(pdict.get("import_kw") or 0.0), phase_kw)
+                    pdict["export_kw"] = max(float(pdict.get("export_kw") or 0.0), phase_kw)
     evs: dict[str, Any] = {} if opt.remove_existing_evs else dict(s.get("electric_vehicles_def", {}))
     for v in fleet.values():
         evs[v.energy_id] = {
