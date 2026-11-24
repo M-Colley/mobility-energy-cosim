@@ -250,3 +250,58 @@ def test_surplus_top_up_needs_minimum_energy_unless_forced() -> None:
     explicit = NoDelivery(charge_on_surplus=True, surplus_target_soc=0.6, surplus_min_chunk_kwh=0.1)
     explicit.reset(ctx)
     assert len(explicit.decide(obs([small], surplus_kw=20.0))) == 1
+
+
+def test_no_repeat_mid_journey_stop_and_remaining_session_deficit() -> None:
+    from mecosim.core.entities import EnergySession, SessionStatus
+
+    ctx = context()
+    v = vstate("av0", "4,0", persons=["p0"], dest="8,0")
+    o = obs([v], deficit_kwh=1.0)
+    o.person_delays_s = {"p0": 180.0}
+    opp = OpportunisticMidJourney(idle_delivery=False, charge_on_surplus=False)
+    opp.reset(ctx)
+    assert chosen(opp, o) == []  # type: ignore[arg-type]
+    opt = OptimizedDelivery(ObjectiveWeights(value_of_time_per_h=0.0), allow_idle=False, charge_on_surplus=False)
+    opt.reset(ctx)
+    assert chosen(opt, o) == []
+    # Remaining deficit subtracts only undelivered energy (5.0 - 4.2 = 0.8 kWh), not full 5.0 kWh.
+    running = EnergySession(
+        id="s1",
+        vehicle_id="av2",
+        hub_id="poor",
+        plug=0,
+        charger_id="poor_c0",
+        direction="discharge",
+        energy_kwh=5.0,
+        power_kw=11.0,
+        planned_duration_s=1700.0,
+        command_time_s=0.0,
+        mid_journey=False,
+        status=SessionStatus.ACTIVE,
+        arrival_s=0.0,
+        measured_terminal_kwh=-4.2,
+    )
+    o2 = obs([vstate("av0", "5,0", soc=0.9)], deficit_kwh=2.0 / 60.0)  # 2.0 kWh over 60 steps
+    o2.sessions = {"s1": running}
+    o2.hubs["poor"] = HubState("poor", 1, ("s1",))
+    g = GreedyDeficitDispatch(delivery_kwh=5.0, charge_on_surplus=False)
+    g.reset(ctx)
+    assert g._remaining_deficit(o2, "east") == pytest.approx(1.2)
+
+
+def test_milp_avoids_end_of_horizon_procrastination() -> None:
+    """With zone concurrency 1 and zero delay weight, two idle vehicles (5 kWh each, 2 slots) beat putting a small
+    passenger vehicle in slot 0 and deferring idle vehicles via uncounted post-horizon spillover."""
+    w = ObjectiveWeights(value_of_time_per_h=0.0, traffic_per_s_curbside=0.0, approach_energy=0.0)
+    p = OptimizedDelivery(w, charge_on_surplus=False)
+    p.reset(context(n=3))
+    vs = [
+        vstate("av0", "5,0", soc=0.9, persons=["p0"], dest="8,0"),
+        vstate("av1", "5,0", soc=0.9),
+        vstate("av2", "5,0", soc=0.9),
+    ]
+    # 15 kW deficit -> concurrency cap 1 vehicle per slot; 15 kWh over the 1-hour horizon.
+    cmds = chosen(p, obs(vs, deficit_kwh=15.0 / 60.0))
+    assert len(cmds) == 1
+    assert cmds[0].vehicle_id in ("av1", "av2") and cmds[0].energy_kwh > 4.5

@@ -66,7 +66,7 @@ def test_exact_delivery_measured_by_citylearn(tmp_path: Path, energy_kwh: float,
     # between the planned power and the per-interval average power (partial intervals).
     assert -dis.measured_terminal_kwh == pytest.approx(energy_kwh, rel=0.01)
     assert -dis.measured_battery_kwh == pytest.approx(energy_kwh / eta, rel=0.02)
-    if timing_owner == "mecosim":
+    if timing_owner == "mecosim" or driver.backend.uses_departure_seconds:
         assert ch.measured_terminal_kwh == pytest.approx(1.5, rel=0.01)
     else:
         # CityLearn's whole-step departure countdown: the stop instant is known only in the departure step, so a
@@ -86,4 +86,53 @@ def test_citylearn_run_with_policies(tmp_path: Path) -> None:
         res = run_scenario(built, name, out_dir=tmp_path / name)
         m = res.metrics
         assert np.isfinite(m["grid_import_kwh"]) and m["persons_completed"] >= 1
+        assert 0.0 <= m["pv_self_consumption"] <= 1.0
         assert "citylearn_electricity_consumption_total" in m
+
+
+def test_citylearn_spec_options_wired(tmp_path: Path) -> None:
+    built = tiny_built(
+        tmp_path,
+        **{
+            **CL,
+            "simulation.duration_s": 300,
+            "energy.citylearn": {
+                **CL["energy.citylearn"],
+                "central_agent": False,
+                "building_actions": "rbc",
+            },
+        },
+    )
+    res = run_scenario(built, "no_delivery", out_dir=tmp_path / "rbc")
+    assert np.isfinite(res.metrics["grid_import_kwh"])
+
+
+def test_citylearn_charge_ceiling_caps_whole_step_session(tmp_path: Path) -> None:
+    """With CityLearn's ``charge_soc_ceiling``, even whole-step departure countdowns stop charging at ``target_soc``."""
+    pytest.importorskip("citylearn.internal.charger_dynamics")
+    built = tiny_built(
+        tmp_path,
+        **{**CL, "demand.ride_period_s": 5000, "simulation.duration_s": 1800, "energy.timing_owner": "energy_model"},
+    )
+
+    def fn(obs, state):  # type: ignore[no-untyped-def]
+        if not state.get("sent") and obs.vehicles["av1"].in_simulation:
+            state["sent"] = True
+            return [EnergyStop("av1", "hw", 1.5, direction="charge")]
+        return []
+
+    orch = make_orchestrator(built, Script(fn), output_dir=tmp_path / "sumo")
+    driver = citylearn_driver(built)
+    assert driver.backend.supports_charge_soc_ceiling
+    assert driver.backend.supports_transfer_efficiency
+    driver.backend.exact_departure = False  # force whole-step countdown so only charge_soc_ceiling caps energy
+    try:
+        orch.run(driver)
+    finally:
+        orch.close()
+    (ch,) = orch.sessions.values()
+    assert ch.status == SessionStatus.DONE and ch.target_soc is not None
+    assert ch.measured_terminal_kwh == pytest.approx(1.5, rel=0.02)
+    ev = next(e for e in driver.env.electric_vehicles if e.name == "av1")
+    soc = np.asarray(ev.battery.soc, dtype=float)[: driver.env.time_step]
+    assert soc.max() <= ch.target_soc + 1e-5

@@ -61,7 +61,8 @@ def estimate_stop(
 ) -> StopEstimate:
     """Estimate travel, detour, arrival SOC and trip reserve for a candidate energy stop."""
     kwh_per_km = consumption.estimate_kwh_per_km(v.id)
-    t_go, km_go = routing.route(v.edge_id, hub.edge_id)
+    route_veh = getattr(routing, "route_vehicle_to_hub", None)
+    t_go, km_go = route_veh(v, hub) if route_veh is not None else routing.route(v.edge_id, hub.edge_id)
     detour_s = detour_km = 0.0
     km_trip = 0.0
     after = hub.edge_id

@@ -13,7 +13,7 @@ import inspect
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -60,6 +60,8 @@ class CityLearnBackend:
         #: (whole-step countdown only).
         self.exact_departure: bool | None = None
         self._supports_departure_seconds: bool | None = None
+        self._supports_charge_soc_ceiling: bool | None = None
+        self._supports_transfer_efficiency: bool | None = None
         self.refresh()
 
     def refresh(self) -> None:
@@ -77,11 +79,15 @@ class CityLearnBackend:
             for name in names:
                 b = by_name[name]
                 es = b.energy_simulation
-                load = load + np.asarray(es.non_shiftable_load, dtype=float)
-                load = load + np.nan_to_num(np.asarray(es.cooling_demand, dtype=float)) / fo.cop
-                load = load + np.nan_to_num(np.asarray(es.heating_demand, dtype=float)) / fo.cop
-                load = load + np.nan_to_num(np.asarray(es.dhw_demand, dtype=float)) / fo.dhw_efficiency
-                pv = pv + np.asarray(b.pv.get_generation(np.asarray(es.solar_generation, dtype=float)), dtype=float)
+                ratio = float(getattr(b, "time_step_ratio", 1.0) or 1.0)
+                load = load + np.asarray(es.non_shiftable_load, dtype=float) * ratio
+                load = load + np.nan_to_num(np.asarray(es.cooling_demand, dtype=float)) * ratio / fo.cop
+                load = load + np.nan_to_num(np.asarray(es.heating_demand, dtype=float)) * ratio / fo.cop
+                load = load + np.nan_to_num(np.asarray(es.dhw_demand, dtype=float)) * ratio / fo.dhw_efficiency
+                pv = (
+                    pv
+                    + np.asarray(b.pv.get_generation(np.asarray(es.solar_generation, dtype=float)), dtype=float) * ratio
+                )
             self._zone_load[zone] = np.asarray(load, dtype=float)
             self._zone_pv[zone] = np.asarray(pv, dtype=float)
         first = env.buildings[0]
@@ -100,13 +106,37 @@ class CityLearnBackend:
     @property
     def supports_departure_seconds(self) -> bool:
         """Capability check: does ``env.mobility.connect`` accept ``departure_seconds``?"""
-        if self._supports_departure_seconds is None:
+        cached = getattr(self, "_supports_departure_seconds", None)
+        if cached is None:
             try:
                 params = inspect.signature(self.env.mobility.connect).parameters
             except (TypeError, ValueError):
                 params = {}
-            self._supports_departure_seconds = "departure_seconds" in params
-        return self._supports_departure_seconds
+            cached = "departure_seconds" in params
+            self._supports_departure_seconds = cached
+        return cached
+
+    @property
+    def supports_charge_soc_ceiling(self) -> bool:
+        """Capability check: does ``env.mobility.connect`` accept ``charge_soc_ceiling``?"""
+        cached = getattr(self, "_supports_charge_soc_ceiling", None)
+        if cached is None:
+            try:
+                params = inspect.signature(self.env.mobility.connect).parameters
+            except (TypeError, ValueError):
+                params = {}
+            cached = "charge_soc_ceiling" in params
+            self._supports_charge_soc_ceiling = cached
+        return cached
+
+    @property
+    def supports_transfer_efficiency(self) -> bool:
+        """Capability check: does ``env.mobility`` expose ``transfer_efficiency``?"""
+        cached = getattr(self, "_supports_transfer_efficiency", None)
+        if cached is None:
+            cached = callable(getattr(self.env.mobility, "transfer_efficiency", None))
+            self._supports_transfer_efficiency = cached
+        return cached
 
     @property
     def uses_departure_seconds(self) -> bool:
@@ -118,6 +148,8 @@ class CityLearnBackend:
         """``env.mobility.connect``. ``departure_seconds`` (exact departure from the start of the step, given by the
         orchestrator with CityLearn-owned timing) is passed only when :attr:`uses_departure_seconds`; without it the
         session dynamics learn the stop instant only in the departure step (see ``docs/models.md``)."""
+        if not self.supports_charge_soc_ceiling:
+            kwargs.pop("charge_soc_ceiling", None)
         dep_s = kwargs.pop("departure_seconds", None)
         if dep_s is not None and self.uses_departure_seconds:
             # CityLearn derives the observed countdown (ceil(departure_seconds / step)); giving both requires them to
@@ -170,12 +202,15 @@ class CityLearnBackend:
     # ------------------------------------------------------------------------------------------- efficiency
     def efficiency(self, charger_id: str, ev_id: str, power_kw: float, direction: str) -> float:
         """Charger efficiency x battery one-way efficiency at ``power_kw`` (CityLearn curves of this EV)."""
+        charging = direction == "charge"
+        if self.supports_transfer_efficiency:
+            return float(self.env.mobility.transfer_efficiency(charger_id, ev_id, power_kw, charging=charging))
         charger = self._chargers[charger_id]
         battery = self._evs[ev_id].battery
-        charging = direction == "charge"
         max_p = charger.max_charging_power if charging else charger.max_discharging_power
         eta_c = float(charger.get_efficiency(power_kw / max(max_p, 1e-9), charging))
-        eta_b = float(battery.get_current_efficiency(power_kw)) ** 0.5
+        dc_kw = power_kw * eta_c if charging else power_kw / max(eta_c, 1e-9)
+        eta_b = float(battery.get_current_efficiency(dc_kw)) ** 0.5
         return eta_c * eta_b
 
     def action_value(self, charger_id: str, target: ChargerTarget) -> float:
@@ -209,15 +244,25 @@ class CityLearnDriver:
         deficit_zones: tuple[str, ...] | None = None,
         env_kwargs: Mapping[str, Any] | None = None,
         forecast: ForecastOptions | None = None,
+        building_actions: Literal["none", "rbc"] = "none",
     ) -> None:
         from citylearn.citylearn import CityLearnEnv
 
         self.schema = dict(schema)
         self.zone_buildings = {z: list(b) for z, b in zone_buildings.items()}
         self.deficit_zones = deficit_zones or tuple(self.zone_buildings)
-        self.env = CityLearnEnv(self.schema, central_agent=True, **dict(env_kwargs or {}))
+        self.building_actions = building_actions
+        central = bool(self.schema.get("central_agent", True))
+        kw = {"central_agent": central, **dict(env_kwargs or {})}
+        self.env = CityLearnEnv(self.schema, **kw)
         self.backend = CityLearnBackend(self.env, self.zone_buildings, forecast)
-        self._action_names: list[str] = list(self.env.action_names[0])
+        self._action_names: list[list[str]] = [list(names) for names in self.env.action_names]
+        self._rbc: Any = None
+        if building_actions == "rbc":
+            from citylearn.agents.rbc import BasicRBC
+
+            self._rbc = BasicRBC(self.env)
+        self._obs: Any = None
         self._done = False
 
     @property
@@ -229,18 +274,25 @@ class CityLearnDriver:
         if provider is not None and hasattr(provider, "bind"):
             provider.bind(self.backend)
         self.env.mobility_provider = provider
-        self.env.reset()
+        self._obs, _ = self.env.reset()
+        if self._rbc is not None:
+            self._rbc.reset()
         self.backend.refresh()
         self._done = False
 
     def step(self, targets: Mapping[str, ChargerTarget]) -> bool:
         prefix = "electric_vehicle_storage_"
-        action = []
-        for name in self._action_names:
-            cid = name[len(prefix) :] if name.startswith(prefix) else None
-            tgt = targets.get(cid) if cid is not None else None
-            action.append(self.backend.action_value(cid, tgt) if tgt is not None else 0.0)
-        _, _, terminated, truncated, _ = self.env.step([action])
+        if self._rbc is not None and self._obs is not None:
+            actions = [list(a) for a in self._rbc.predict(self._obs)]
+        else:
+            actions = [[0.0] * len(names) for names in self._action_names]
+        for i, names in enumerate(self._action_names):
+            for j, name in enumerate(names):
+                if name.startswith(prefix):
+                    cid = name[len(prefix) :]
+                    tgt = targets.get(cid)
+                    actions[i][j] = self.backend.action_value(cid, tgt) if tgt is not None else 0.0
+        self._obs, _, terminated, truncated, _ = self.env.step(actions)
         self._done = bool(terminated or truncated)
         return self._done
 
@@ -265,21 +317,25 @@ class CityLearnDriver:
         out: dict[str, float] = {}
         imp_total = np.zeros(n)
         exp_total = np.zeros(n)
-        pv = 0.0
+        pv = pv_used = 0.0
         ev_ch = ev_dis = 0.0
         deficit = served = 0.0
         for zone, names in self.zone_buildings.items():
             zone_net = np.zeros(n)
             zone_ev = np.zeros(n)
+            zone_pv = np.zeros(n)
             for name in names:
                 b = by_name[name]
                 zone_net += np.asarray(b.net_electricity_consumption, dtype=float)[:n]
-                pv += float(-np.asarray(b.solar_generation, dtype=float)[:n].sum())
+                zone_pv += -np.asarray(b.solar_generation, dtype=float)[:n]
                 for c in getattr(b, "electric_vehicle_chargers", None) or []:
                     zone_ev += np.asarray(c.electricity_consumption, dtype=float)[:n]
             zimp = np.clip(zone_net, 0.0, None)
+            zexp = np.clip(-zone_net, 0.0, None)
             imp_total += zimp
-            exp_total += np.clip(-zone_net, 0.0, None)
+            exp_total += zexp
+            pv += float(zone_pv.sum())
+            pv_used += float(np.clip(zone_pv - zexp, 0.0, zone_pv).sum())
             ev_ch += float(np.clip(zone_ev, 0, None).sum())
             ev_dis += float(np.clip(-zone_ev, 0, None).sum())
             out[f"import_kwh_{zone}"] = float(zimp.sum())
@@ -296,7 +352,7 @@ class CityLearnDriver:
         out["district_import_kwh"] = float(np.clip(net_d, 0.0, None).sum())
         out["district_export_kwh"] = float(np.clip(-net_d, 0.0, None).sum())
         out["pv_generation_kwh"] = pv
-        out["pv_self_consumption"] = (pv - out["grid_export_kwh"]) / pv if pv > 0 else math.nan
+        out["pv_self_consumption"] = pv_used / pv if pv > 0 else math.nan
         out["ev_charged_kwh"] = ev_ch
         out["ev_discharged_kwh"] = ev_dis
         out["zone_deficit_kwh"] = deficit

@@ -22,14 +22,13 @@ from pathlib import Path
 
 from mecosim.adapters.sumo.capabilities import SumoCapabilities, detect_capabilities
 from mecosim.adapters.sumo.connection import SumoConnection, SumoConnectionConfig, open_connection
+from mecosim.adapters.sumo.native_v2g import NATIVE_V2G_VAR, probe_native_v2g
 from mecosim.core.entities import Hub, RideRequest, VehicleSpec, VehicleState
 from mecosim.core.protocols import MobilityEvent
 
-__all__ = ["SumoFederateConfig", "SumoFederate"]
+__all__ = ["SumoFederateConfig", "SumoFederate", "NATIVE_V2G_VAR"]
 
 _INVALID = -1e9
-#: TraCI variable of ``chargingstation.get/setDischargePower`` in the native V2G SUMO build (sumo_api.md).
-NATIVE_V2G_VAR = 0x9E
 
 
 @dataclass
@@ -71,6 +70,7 @@ class SumoFederate:
         self.conn: SumoConnection | None = None
         self.capabilities: SumoCapabilities | None = None
         self._station_to_hub = {h.station_id: h.id for h in self.hubs.values()}
+        self._station_meta: dict[str, tuple[str, float, float, float, float]] = {}
         self._route_cache: dict[tuple[str, str, int], tuple[float, float]] = {}
         self._current_stop: dict[str, str] = {}
         self._ids: set[str] = set()
@@ -81,6 +81,7 @@ class SumoFederate:
         self._pending_events: list[MobilityEvent] = []
         self._scheduled_end: dict[str, tuple[float, str]] = {}
         self._native_discharged_wh: dict[str, float] = {}
+        self._active_native_v2g: set[str] = set()
 
     # ------------------------------------------------------------------------------------------- lifecycle
     @property
@@ -99,10 +100,24 @@ class SumoFederate:
 
     def start(self) -> None:
         self.conn = open_connection(self.config.connection)
-        self.capabilities = detect_capabilities(self.conn.api)
-        if self.config.zero_station_power:
-            for hub in self.hubs.values():
+        probe_station = next(iter(self.hubs.values())).station_id if self.hubs else None
+        self.capabilities = detect_capabilities(
+            self.conn.api, probe_station=probe_station, exceptions=self.conn.exceptions
+        )
+        self._station_meta.clear()
+        self._active_native_v2g.clear()
+        for hub in self.hubs.values():
+            if self.config.zero_station_power:
                 self.api.chargingstation.setChargingPower(hub.station_id, 0.0)
+            try:
+                lane_id = str(self.api.chargingstation.getLaneID(hub.station_id))
+                s_pos = float(self.api.chargingstation.getStartPos(hub.station_id))
+                e_pos = float(self.api.chargingstation.getEndPos(hub.station_id))
+                length = float(self.api.lane.getLength(lane_id))
+                speed = max(1.0, float(self.api.lane.getMaxSpeed(lane_id)))
+                self._station_meta[hub.station_id] = (lane_id, s_pos, e_pos, length, speed)
+            except (AttributeError, *self._exc):
+                pass
 
     def close(self) -> None:
         if self.conn is not None:
@@ -238,7 +253,10 @@ class SumoFederate:
     def _driving_km(self, vid: str, edge: str, pos: float) -> float:
         api = self.api
         if pos < 0:
-            pos = float(api.lane.getLength(edge + "_0"))
+            try:
+                pos = float(api.lane.getLength(edge + "_0"))
+            except self._exc:
+                pos = 0.0
         try:
             d = float(api.vehicle.getDrivingDistance(vid, edge, pos))
         except self._exc:
@@ -284,18 +302,72 @@ class SumoFederate:
         upcoming = len(stops) - (1 if stopped else 0)
         has_task = self._taxi_state(vehicle_id) != 0 or api.vehicle.getPersonNumber(vehicle_id) > 0
         try:
-            if has_task and upcoming > 0:
-                index = len(stops) if after_tasks else (1 if stopped else 0)
+            if has_task:
+                if after_tasks and stops:
+                    index = len(stops)
+                elif not after_tasks and upcoming > 0:
+                    index = 1 if stopped else 0
+                else:
+                    # Standing at the final drop-off (or task with no upcoming stop): never fall through to the
+                    # idle-redirect branch, which would resume/reroute and strand the passenger.
+                    return False
+                if not after_tasks and api.vehicle.getPersonNumber(vehicle_id) > 0:
+                    station_edge = self._lane_edge(api.chargingstation.getLaneID(station_id))
+                    next_edge = self._lane_edge(stops[index].lane)
+                    if station_edge == next_edge:
+                        if not self.taxi_keeps_energy_stops(vehicle_id):
+                            # Stock SUMO unloads passengers at a chargingStation on their destination edge and aborts
+                            # remaining stops ("All customers left vehicle ... remaining stops").
+                            return False
+                        meta = self._station_meta.get(station_id)
+                        if meta is not None and meta[2] >= float(stops[index].endPos) - 1e-3:
+                            return False
                 api.vehicle.insertStop(vehicle_id, index, station_id, duration=duration_s, flags=flags)
             else:
-                edge = self._lane_edge(api.chargingstation.getLaneID(station_id))
-                api.vehicle.changeTarget(vehicle_id, edge)
+                lane_id = str(api.chargingstation.getLaneID(station_id))
+                edge = self._lane_edge(lane_id)
+                meta = self._station_meta.get(station_id)
+                cur_edge = api.vehicle.getRoadID(vehicle_id)
+                cur_pos = float(api.vehicle.getLanePosition(vehicle_id))
+                if cur_edge == edge and meta is not None and cur_pos > meta[2] + 1.0:
+                    loop = self._loop_edges(lane_id, edge)
+                    if not loop:
+                        return False
+                    api.vehicle.setRoute(vehicle_id, [edge, *loop])
+                else:
+                    api.vehicle.changeTarget(vehicle_id, edge)
                 if stopped:
                     api.vehicle.resume(vehicle_id)
                 api.vehicle.setStop(vehicle_id, station_id, duration=duration_s, flags=flags)
         except self._exc:
             return False
         return True
+
+    def _loop_edges(self, lane_id: str, target_edge: str) -> list[str]:
+        """Shortest non-empty loop of edges from a successor of ``lane_id`` back to ``target_edge``."""
+        best_t = math.inf
+        best_edges: list[str] = []
+        try:
+            links = self.api.lane.getLinks(lane_id)
+        except self._exc:
+            return []
+        seen: set[str] = set()
+        for link in links:
+            if not link or not link[0]:
+                continue
+            succ = self._lane_edge(str(link[0]))
+            if succ in seen or succ.startswith(":"):
+                continue
+            seen.add(succ)
+            try:
+                stage = self.api.simulation.findRoute(succ, target_edge, vType=self.config.routing_vtype)
+                edges = list(stage.edges)
+                if edges and float(stage.travelTime) < best_t:
+                    best_t = float(stage.travelTime)
+                    best_edges = edges
+            except self._exc:
+                continue
+        return best_edges
 
     def set_stop_duration(self, vehicle_id: str, duration_s: float) -> None:
         self.api.vehicle.setStopParameter(vehicle_id, 0, "duration", str(max(0.0, duration_s)))
@@ -364,17 +436,7 @@ class SumoFederate:
         if not self.hubs:
             return False
         station = next(iter(self.hubs.values())).station_id
-        try:
-            fn = getattr(self.api.chargingstation, "getDischargePower", None)
-            if fn is not None:
-                fn(station)
-            elif hasattr(self.api.chargingstation, "_getUniversal"):
-                self.api.chargingstation._getUniversal(NATIVE_V2G_VAR, station)
-            else:
-                return False
-        except (AttributeError, IndexError, *self._exc):
-            return False
-        return True
+        return probe_native_v2g(self.api, station_id=station, exceptions=self._exc)
 
     def _set_discharge_power(self, station_id: str, watts: float) -> None:
         fn = getattr(self.api.chargingstation, "setDischargePower", None)
@@ -397,6 +459,12 @@ class SumoFederate:
         The station's ``efficiency`` is set to the session's terminal-to-battery efficiency and its ``chargeDelay`` to
         the zero-power time before transfer (coupling + start-up + set-point delay); SUMO's profile is rectangular.
         """
+        for other in self.fleet:
+            if other != vehicle_id and other not in self._active_native_v2g and self.in_simulation(other):
+                try:
+                    self.api.vehicle.setParameter(other, "device.battery.maximumDischargeRate", "0")
+                except self._exc:
+                    pass
         cap = self._capacity_wh(vehicle_id)
         self.api.chargingstation.setEfficiency(station_id, efficiency)
         self.api.chargingstation.setChargeDelay(station_id, delay_s)
@@ -406,11 +474,14 @@ class SumoFederate:
         self.api.vehicle.setParameter(
             vehicle_id, "device.battery.maximumDischargeRate", repr(power_kw * 1000.0 / max(eff, 1e-9))
         )
+        self._active_native_v2g.add(vehicle_id)
         self._native_discharged_wh[vehicle_id] = self.native_total_discharged_wh(vehicle_id)
 
     def native_v2g_end(self, vehicle_id: str) -> None:
+        self._active_native_v2g.discard(vehicle_id)
         if self.in_simulation(vehicle_id):
             self.api.vehicle.setParameter(vehicle_id, "device.battery.maximumDischargeRate", "0")
+            self.api.vehicle.setParameter(vehicle_id, "device.battery.minimumChargeLevel", "0")
 
     def native_total_discharged_wh(self, vehicle_id: str) -> float:
         return float(self.api.vehicle.getParameter(vehicle_id, "device.battery.totalEnergyDischarged"))
@@ -446,6 +517,41 @@ class SumoFederate:
             self._route_cache.clear()
         self._route_cache[key] = result
         return result
+
+    def route_vehicle_to_hub(self, v: VehicleState, hub: Hub) -> tuple[float, float]:
+        """Position-aware travel ``(time_s, length_km)`` from ``v`` to ``hub`` (accounts for passed stations)."""
+        if not v.edge_id:
+            return (math.inf, math.inf)
+        if v.stopped and self._current_stop.get(v.id) == hub.station_id:
+            return (0.0, 0.0)
+        if v.edge_id != hub.edge_id:
+            return self.route(v.edge_id, hub.edge_id)
+        meta = self._station_meta.get(hub.station_id)
+        if meta is None:
+            return (0.0, 0.0)
+        lane_id, _start_pos, end_pos, length, speed = meta
+        if v.position <= end_pos + 1.0:
+            dist_m = max(0.0, end_pos - v.position)
+            return (dist_m / speed, dist_m / 1000.0)
+        # Vehicle already passed the chargingStation on this edge: must leave the edge and loop back.
+        rem_m = max(0.0, length - v.position)
+        best_t, best_km = math.inf, math.inf
+        try:
+            links = self.api.lane.getLinks(lane_id)
+        except self._exc:
+            return (math.inf, math.inf)
+        for link in links:
+            if not link or not link[0]:
+                continue
+            succ = self._lane_edge(str(link[0]))
+            if succ.startswith(":"):
+                continue
+            lt, lkm = self.route(succ, hub.edge_id)
+            if lt < best_t:
+                best_t, best_km = lt, lkm
+        if not math.isfinite(best_t):
+            return (math.inf, math.inf)
+        return (rem_m / speed + best_t, rem_m / 1000.0 + best_km)
 
     def taxi_keeps_energy_stops(self, vehicle_id: str) -> bool:
         """Native taxi-device energy stops (SUMO branch ``taxi-energy-stops``, refs #15586), detected by the

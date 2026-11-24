@@ -144,13 +144,24 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
                 raise ValueError(f"no edge in zone {hs.zone} long enough for hub {hs.id} ({need:.0f} m)")
             edge_id = min(cands, key=lambda e: (mids[e][0] - cx) ** 2 + (mids[e][1] - cy) ** 2)
         used.add(edge_id)
-        length = net.getEdge(edge_id).getLength()  # type: ignore[attr-defined]
+        try:
+            edge_obj = net.getEdge(edge_id)  # type: ignore[attr-defined]
+        except KeyError as exc:
+            raise ValueError(f"hub {hs.id}: unknown edge {edge_id!r}") from exc
+        taxi_lanes = [ln for ln in edge_obj.getLanes() if ln.allows("taxi")]
+        if not taxi_lanes:
+            raise ValueError(f"hub {hs.id}: edge {edge_id!r} has no lane allowing 'taxi'")
+        lane_id = str(taxi_lanes[0].getID())
+        length = float(edge_obj.getLength())
         span = hs.plugs * PLUG_LENGTH_M
+        if length < span:
+            raise ValueError(f"hub {hs.id}: edge {edge_id!r} ({length:.1f} m) is shorter than {span:.1f} m")
         start = max(0.0, 0.5 * (length - span))
         station_id = f"cs_{hs.id}"
         stations.append(
-            f'    <chargingStation id={quoteattr(station_id)} lane="{edge_id}_0" startPos="{start:.2f}" '
-            f'endPos="{start + span:.2f}" power="0" efficiency="1" chargeInTransit="false" chargeDelay="0"/>'
+            f"    <chargingStation id={quoteattr(station_id)} lane={quoteattr(lane_id)} "
+            f'startPos="{start:.2f}" endPos="{start + span:.2f}" '
+            f'power="0" efficiency="1" chargeInTransit="false" chargeDelay="0"/>'
         )
         hubs[hs.id] = Hub(
             id=hs.id,
@@ -262,9 +273,9 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
     cfg.write_text(
         f"""<configuration>
   <input>
-    <net-file value="{net_file}"/>
-    <route-files value="{",".join(str(p) for p in route_files)}"/>
-    <additional-files value="{add_file}"/>
+    <net-file value={quoteattr(str(net_file))}/>
+    <route-files value={quoteattr(",".join(str(p) for p in route_files))}/>
+    <additional-files value={quoteattr(str(add_file))}/>
   </input>
   <time>
     <begin value="{begin}"/>
