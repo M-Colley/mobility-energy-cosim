@@ -26,9 +26,13 @@ from mecosim.adapters.sumo.native_v2g import NATIVE_V2G_VAR, probe_native_v2g
 from mecosim.core.entities import Hub, RideRequest, VehicleSpec, VehicleState
 from mecosim.core.protocols import MobilityEvent
 
-__all__ = ["SumoFederateConfig", "SumoFederate", "NATIVE_V2G_VAR"]
+__all__ = ["SumoFederateConfig", "SumoFederate", "FleetVehicleLostError", "NATIVE_V2G_VAR"]
 
 _INVALID = -1e9
+
+
+class FleetVehicleLostError(RuntimeError):
+    """A fleet vehicle that was in the simulation is gone (SUMO removed it)."""
 
 
 @dataclass
@@ -43,6 +47,11 @@ class SumoFederateConfig:
         route_cache_s: Validity of cached routing estimates.
         routing_vtype: Vehicle type used for routing estimates (fleet type).
         stop_parking: Default ``parking`` flag of energy stops at off-street hubs.
+        mode: ``"micro"`` or ``"meso"`` (the SUMO arguments carry ``--mesosim``). In meso mode ``vehicle.isStopped``
+            (``getStopState`` is not implemented there) is replaced by the stop list, and a fleet vehicle that SUMO
+            removes raises :class:`FleetVehicleLostError`.
+        state_file: Where :meth:`SumoFederate.snapshot` saves the warm state that :meth:`SumoFederate.rewind`
+            restarts from (binary ``.sbx``).
     """
 
     connection: SumoConnectionConfig = field(default_factory=SumoConnectionConfig)
@@ -52,6 +61,8 @@ class SumoFederateConfig:
     route_cache_s: float = 300.0
     routing_vtype: str = ""
     stop_parking: bool = True
+    mode: str = "micro"
+    state_file: Path | None = None
 
 
 class SumoFederate:
@@ -82,6 +93,12 @@ class SumoFederate:
         self._scheduled_end: dict[str, tuple[float, str]] = {}
         self._native_discharged_wh: dict[str, float] = {}
         self._active_native_v2g: set[str] = set()
+        self._meso = self.config.mode == "meso"
+        self._fleet_seen: set[str] = set()
+        self._known_reservations: set[str] = set()
+        self._t_start = 0.0
+        self._warm_state = False
+        self._warm_time = 0.0
 
     # ------------------------------------------------------------------------------------------- lifecycle
     @property
@@ -104,6 +121,10 @@ class SumoFederate:
         self.capabilities = detect_capabilities(
             self.conn.api, probe_station=probe_station, exceptions=self.conn.exceptions
         )
+        self._t_start = self.time_s
+        self._init_stations()
+
+    def _init_stations(self) -> None:
         self._station_meta.clear()
         self._active_native_v2g.clear()
         for hub in self.hubs.values():
@@ -124,6 +145,45 @@ class SumoFederate:
             self.conn.close()
             self.conn = None
 
+    def snapshot(self) -> bool:
+        """Save the current state as the warm state of :meth:`rewind` (only after a warm-up, with ``state_file``)
+        and reload it.
+
+        ``simulation.loadState`` drops the not yet departed persons and vehicles of the route files (verified with SUMO
+        1.28), so the state is restored with ``--load-state`` at a SUMO reload instead.
+        """
+        path = self.config.state_file
+        if path is None or self.time_s <= self._t_start:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.api.simulation.saveState(str(path))
+        self._warm_state = True
+        self._warm_time = self.time_s
+        self.rewind()  # every episode, the first included, starts from the loaded state (the RNG is not saved in it)
+        return True
+
+    def rewind(self) -> None:
+        """Reload the simulation in place at its initial state (the warm state when saved) and reset the per-episode
+        state of the federate. This replaces closing and starting SUMO between episodes."""
+        if self.conn is None:
+            raise RuntimeError("SumoFederate not started")
+        args = list(self.config.connection.args)
+        if self._warm_state and self.config.state_file is not None:
+            args += ["--load-state", str(self.config.state_file), "--begin", repr(self._warm_time)]
+        self.conn.load(args)
+        self._route_cache.clear()
+        self._current_stop.clear()
+        self._ids = set()
+        self._ids_time = -1.0
+        self.arrived_persons = []
+        self.teleports = 0
+        self._pending_events.clear()
+        self._scheduled_end.clear()
+        self._native_discharged_wh.clear()
+        self._fleet_seen.clear()
+        self._known_reservations.clear()
+        self._init_stations()
+
     # ------------------------------------------------------------------------------------------- stepping
     def _refresh_ids(self) -> set[str]:
         t = self.time_s
@@ -132,8 +192,12 @@ class SumoFederate:
             self._ids_time = t
         return self._ids
 
-    def advance(self, until_s: float) -> list[MobilityEvent]:
-        """Step SUMO one step at a time up to ``until_s`` and collect fleet stop events (exact to one step)."""
+    def advance(self, until_s: float, stop_on_event: bool = False) -> list[MobilityEvent]:
+        """Step SUMO one step at a time up to ``until_s`` and collect fleet stop events (exact to one step).
+
+        With ``stop_on_event`` it returns right after the first step that produced a fleet stop event or a new open
+        ride request (decision epochs of ``decision: event``); the caller continues with another call.
+        """
         api = self.api
         events: list[MobilityEvent] = list(self._pending_events)
         self._pending_events.clear()
@@ -168,7 +232,28 @@ class SumoFederate:
                 self.arrived_persons.append((t, pid))
                 events.append(MobilityEvent("person_arrived", t, persons=(pid,)))
             self.teleports += int(api.simulation.getStartingTeleportNumber())
+            if stop_on_event and (events or self._new_requests()):
+                break
+        if self._meso:
+            self._check_fleet()
         return events
+
+    def _new_requests(self) -> bool:
+        ids = {str(r.id) for r in self.api.person.getTaxiReservations(3)}
+        new = bool(ids - self._known_reservations)
+        self._known_reservations = ids
+        return new
+
+    def _check_fleet(self) -> None:
+        present = self._refresh_ids()
+        for vid in self.fleet:
+            if vid in present:
+                self._fleet_seen.add(vid)
+            elif vid in self._fleet_seen:
+                raise FleetVehicleLostError(
+                    f"fleet vehicle {vid!r} was removed by SUMO at t={self.time_s:.0f} s. The meso taxi device drops "
+                    "fleet taxis in SUMO builds without the fix; use simulation.mode: micro or a fixed SUMO build"
+                )
 
     # ------------------------------------------------------------------------------------------- vehicle state
     def _battery_wh(self, vid: str) -> float:
@@ -197,6 +282,14 @@ class SumoFederate:
         self._has_taxi[vid] = True
         return state
 
+    def _is_stopped(self, vid: str, stops: Sequence[object] | None = None) -> bool:
+        """``vehicle.isStopped``; in meso mode from the stop list (``getStopState`` is not implemented there)."""
+        if not self._meso:
+            return bool(self.api.vehicle.isStopped(vid))
+        if stops is None:
+            stops = self.api.vehicle.getStops(vid, 1)
+        return bool(stops) and stops[0].arrival >= 0 and stops[0].depart < 0  # type: ignore[attr-defined]
+
     def in_simulation(self, vid: str) -> bool:
         return vid in self._refresh_ids()
 
@@ -204,6 +297,8 @@ class SumoFederate:
         spec = self.fleet[vehicle_id]
         t = self.time_s
         if not self.in_simulation(vehicle_id):
+            if self._meso and vehicle_id in self._fleet_seen:
+                self._check_fleet()
             return VehicleState(vehicle_id, t, spec.initial_soc, spec.capacity_kwh, in_simulation=False)
         api = self.api
         cap_wh = self._capacity_wh(vehicle_id)
@@ -226,7 +321,7 @@ class SumoFederate:
             edge_id=edge,
             position=pos,
             speed_mps=float(api.vehicle.getSpeed(vehicle_id)),
-            stopped=bool(api.vehicle.isStopped(vehicle_id)),
+            stopped=self._is_stopped(vehicle_id, stops),
             persons=persons,
             taxi_state=self._taxi_state(vehicle_id),
             odometer_km=self._odometer(vehicle_id),
@@ -297,8 +392,8 @@ class SumoFederate:
         api = self.api
         tc = self.conn.constants  # type: ignore[union-attr]
         flags = tc.STOP_CHARGING_STATION | (tc.STOP_PARKING if parking else 0)
-        stopped = bool(api.vehicle.isStopped(vehicle_id))
         stops = api.vehicle.getStops(vehicle_id)
+        stopped = self._is_stopped(vehicle_id, stops)
         upcoming = len(stops) - (1 if stopped else 0)
         has_task = self._taxi_state(vehicle_id) != 0 or api.vehicle.getPersonNumber(vehicle_id) > 0
         try:
@@ -378,7 +473,7 @@ class SumoFederate:
         SUMO does not list stops ended by ``resume`` in ``getStopEndingVehiclesIDList`` (verified with 1.28), so the
         event is synthesised here.
         """
-        if self.in_simulation(vehicle_id) and self.api.vehicle.isStopped(vehicle_id):
+        if self.in_simulation(vehicle_id) and self._is_stopped(vehicle_id):
             place = self._current_stop.pop(vehicle_id, "")
             self.api.vehicle.resume(vehicle_id)
             self._pending_events.append(
@@ -407,7 +502,7 @@ class SumoFederate:
             if t < te - 1e-6:
                 continue
             del self._scheduled_end[vid]
-            if not self.in_simulation(vid) or not self.api.vehicle.isStopped(vid):
+            if not self.in_simulation(vid) or not self._is_stopped(vid):
                 continue
             if self._current_stop.get(vid) != station:
                 continue

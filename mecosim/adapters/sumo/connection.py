@@ -92,6 +92,10 @@ class SumoConnection:
     def step(self, until_s: float = 0.0) -> None:
         self.api.simulationStep(until_s)
 
+    def load(self, args: list[str]) -> None:
+        """Reload the simulation with ``args`` (no binary) in the running process or SUMO instance."""
+        self.api.load(list(args))
+
     def version(self) -> tuple[int, str]:
         return tuple(self.api.getVersion())  # type: ignore[return-value]
 
