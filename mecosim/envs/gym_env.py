@@ -132,6 +132,9 @@ class MecosimEnv(gym.Env):
             self.built = replace(build_scenario_cached(scenario, cache_dir), out_dir=self.out_dir / "scenario")
         else:
             self.built = build_scenario(scenario, self.out_dir / "scenario")
+        if decision == "event" and self.built.spec.energy.backend == "citylearn":
+            # CityLearn accepts charger writes only inside its mobility callbacks (no pause mid-interval).
+            raise ValueError("decision='event' needs energy.backend='reference' (CityLearn cannot pause inside a step)")
         self.fast_reset = bool(fast_reset)
         self.decision = decision
         self.sumo_extra = list(sumo_extra or [])
