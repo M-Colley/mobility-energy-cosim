@@ -134,7 +134,12 @@ def summarize_validation(frame: pd.DataFrame, reference: str = "full") -> dict[s
                 r, m = merged[f"{k}_ref"].astype(float), merged[k].astype(float)
                 mean_r, mean_m = float(r.mean()), float(m.mean())
                 pair = (m - r).abs() / r.abs().where(r.abs() > 1e-9)
+                diffs = (m - r).to_numpy()
+                p_paired = (
+                    float(stats.ttest_rel(m, r).pvalue) if len(diffs) > 2 and np.ptp(diffs) > 1e-12 else float("nan")
+                )
                 kpis[k] = {
+                    "paired_p": p_paired,
                     "ref_mean": mean_r,
                     "mean": mean_m,
                     "rel_diff_of_means": (mean_m - mean_r) / mean_r if abs(mean_r) > 1e-9 else float("nan"),
@@ -160,7 +165,8 @@ def format_summary(summary: Mapping[str, Any]) -> str:
             for name, v in e["kpis"].items():
                 lines.append(
                     f"{name:32s} ref={v['ref_mean']:10.3f} mode={v['mean']:10.3f} "
-                    f"diff={100 * v['rel_diff_of_means']:7.1f}%  paired MAPE={100 * v['paired_mape']:6.1f}%"
+                    f"diff={100 * v['rel_diff_of_means']:7.1f}% (paired p={v['paired_p']:.2f})  "
+                    f"paired MAPE={100 * v['paired_mape']:6.1f}%"
                 )
     return "\n".join(lines)
 

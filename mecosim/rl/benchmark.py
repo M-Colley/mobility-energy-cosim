@@ -39,6 +39,21 @@ def level_schedule(level: str, seed: int) -> tuple[str | FidelitySchedule, float
 
 
 def _train_eval(args: tuple[Any, list[Any], str, int, int, str, int]) -> dict[str, Any]:
+    """One (level, seed) policy; the result is cached in ``<level>_s<seed>/result.json`` so a rerun resumes."""
+    level, rl_seed, out = args[2], args[4], args[5]
+    done = Path(out) / f"{level}_s{rl_seed}" / "result.json"
+    if done.exists():
+        return json.loads(done.read_text(encoding="utf-8"))
+    try:
+        row = _train_eval_uncached(args)
+    except Exception as exc:  # noqa: BLE001 - simulator exceptions are not picklable across processes
+        raise RuntimeError(f"{level} seed {rl_seed} failed: {exc!r}") from None
+    done.parent.mkdir(parents=True, exist_ok=True)
+    done.write_text(json.dumps(row), encoding="utf-8")
+    return row
+
+
+def _train_eval_uncached(args: tuple[Any, list[Any], str, int, int, str, int]) -> dict[str, Any]:
     train_built, eval_builts, level, budget, rl_seed, out, eval_episodes = args
     from mecosim.rl.train import evaluate, train_ppo, zero_policy
 

@@ -206,6 +206,14 @@ last drop-off, and turns an idle taxi's stop into an indefinite wait; mecosim wo
 after each dispatch, deferral until the taxi is idle, timed `resume`). See
 [docs/models.md, section 6](docs/models.md#6-mobility-side-sumo-taxi-device-and-energy-stops-stock-sumo).
 
+## Mobility fidelity levels
+
+SUMO dominates the cost of a master step. Two opt-in levels are cheaper: `demand.background_mode: speed_field` replaces the
+background vehicles with recorded per-edge speeds, and `simulation.fidelity: surrogate` replaces SUMO with a pure-Python
+event simulation of the fleet on the SUMO network. Both use a calibration from full SUMO runs (`mecosim calibrate`).
+`mecosim train-rl --fidelity-schedule surrogate:0.8,sumo:0.2` trains PPO on a mixture of levels. Validation against full
+SUMO, speed and the sim-to-sim gap: [docs/fidelity.md](docs/fidelity.md).
+
 ## CARLA
 
 mecosim and CARLA's SUMO co-simulation bridge run as two TraCI clients of one SUMO in lockstep (`--num-clients 2`,
@@ -242,6 +250,7 @@ that mimics the bridge; CARLA itself was not run.
   the demo's PV-rich zone would cover the PV-poor zone without any vehicle.
 - PettingZoo agents are vehicles only (no hub or building agents); building control stays with CityLearn's controller.
 - libsumo runs one SUMO per process; sweeps use processes (`--jobs`).
+- `speed_field` and `surrogate` do not model the fleet's effect on background traffic (for example curbside stops); see [docs/fidelity.md](docs/fidelity.md).
 
 ## Development
 

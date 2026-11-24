@@ -76,7 +76,8 @@ energy is computed, and energy is integrated exactly over the connected part of 
 - `EnergyDriver`: `reset(provider)`, `step(targets) -> done`, `kpis()`, `n_steps`.
 - `Policy`: `reset(context)`, `decide(observation) -> commands`.
 
-See `docs/extending.md` for adding a simulator or a policy.
+`MobilityFederate` has two implementations: `SumoFederate` and the pure-Python `SurrogateFederate` (selected with
+`simulation.fidelity`; see [fidelity.md](fidelity.md)). See `docs/extending.md` for adding a simulator or a policy.
 
 ## Outputs of a run
 
