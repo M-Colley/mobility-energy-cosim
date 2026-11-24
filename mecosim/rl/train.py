@@ -57,8 +57,11 @@ def train_ppo(
     save: bool = True,
 ) -> TrainResult:
     """Train PPO for ``timesteps`` environment steps (one step = one master step)."""
+    import torch
     from stable_baselines3 import PPO
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+    torch.set_num_threads(1)  # tiny networks: multi-threading only adds overhead
 
     out = absolute(out)
     counts: dict[str, int] = {}

@@ -102,6 +102,7 @@ class RoadGraph:
         self._profile: SpeedProfile | None = None
         self._graphs: dict[int, csr_matrix] = {}
         self._sp: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+        self._sp_cap = max(64, int(2e8 // (12 * max(1, len(edges)))))  # about 200 MB of cached path trees
 
     # ------------------------------------------------------------------------------------------- speeds
     @property
@@ -154,7 +155,7 @@ class RoadGraph:
             g = csr_matrix((w[self._cols], (self._rows, self._cols)), shape=(n, n))
             self._graphs[b] = g
         dist, pred = dijkstra(g, directed=True, indices=source, return_predecessors=True)
-        if len(self._sp) > 20000:
+        if len(self._sp) >= self._sp_cap:
             self._sp.clear()
         self._sp[key] = (dist, pred)
         return dist, pred
