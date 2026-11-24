@@ -1,0 +1,5 @@
+policy,variant,grid_import_kwh_pct,emissions_kg_pct,zone_deficit_served_kwh_pct,ev_discharged_kwh_pct,ev_charged_kwh_pct,energy_stops_pct,throughput_trips_per_h_pct,mean_person_wait_s_pct,passenger_delay_per_trip_s_pct
+greedy_deficit,master900_decide900,160.4,160.4,-100.0,-100.0,-100.0,-100.0,-33.3,469.0,nan
+greedy_deficit,master900_decide60,8.4,8.4,-5.2,-5.2,-23.5,-8.3,0.0,-14.2,nan
+optimized,master900_decide900,166.4,166.4,-100.0,-100.0,-100.0,-100.0,-33.3,501.2,nan
+optimized,master900_decide60,6.2,6.1,-3.7,-3.7,-27.8,0.0,0.0,-9.3,nan

@@ -126,12 +126,29 @@ class SimulationSpec(_Model):
     mobility_step_s: float = 1.0
     start_hour: float = 10.0
     decision_period_s: float | None = None
+    #: ``"eval"`` writes SUMO's tripinfo/statistics/stop outputs and log (needed by ``mobility_metrics``); ``"train"``
+    #: switches them off and adds safe speed options (see ``BuiltScenario.sumo_args``).
+    profile: Literal["eval", "train"] = "eval"
+    #: ``"micro"`` (default) or ``"meso"`` (``--mesosim``; needs a SUMO build that keeps the fleet taxis).
+    mode: Literal["micro", "meso"] = "micro"
+    #: Background traffic runs alone for this long before master step 0, so episodes start in a loaded network.
+    #: Fleet and ride requests start at ``begin_s + warmup_s``.
+    warmup_s: float = 0.0
+    #: Upper bound of a random delay (drawn per episode by ``MecosimEnv``) between the end of the warm-up and master
+    #: step 0. Ride requests accumulate during it. Demand is generated for ``duration_s + start_offset_max_s``.
+    start_offset_max_s: float = 0.0
 
     @model_validator(mode="after")
     def _validate_steps(self) -> SimulationSpec:
         Clock(self.master_step_s, self.mobility_step_s, self.begin_s, self.decision_period_s)
         if self.duration_s <= 0:
             raise ValueError("duration_s must be > 0")
+        if self.warmup_s < 0 or self.start_offset_max_s < 0:
+            raise ValueError("warmup_s and start_offset_max_s must be >= 0")
+        for name in ("warmup_s", "start_offset_max_s"):
+            ratio = getattr(self, name) / self.mobility_step_s
+            if not math.isclose(ratio, round(ratio), rel_tol=0, abs_tol=1e-9):
+                raise ValueError(f"{name} must be an integer multiple of mobility_step_s")
         ratio = self.duration_s / self.master_step_s
         if not math.isclose(ratio, round(ratio), rel_tol=0, abs_tol=1e-9):
             raise ValueError("duration_s must be an integer multiple of master_step_s")
@@ -140,6 +157,11 @@ class SimulationSpec(_Model):
     @property
     def n_steps(self) -> int:
         return int(round(self.duration_s / self.master_step_s))
+
+    @property
+    def episode_begin_s(self) -> float:
+        """Mobility time of master step 0 (without the random start offset): ``begin_s + warmup_s``."""
+        return self.begin_s + self.warmup_s
 
 
 class CityLearnSpec(_Model):

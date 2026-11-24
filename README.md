@@ -213,6 +213,85 @@ Decoupled policies (`no_delivery`, `greedy_deficit`, `opportunistic_mid_journey`
 (0.67 kWh at 11 kW; see docs/models.md); low-SOC recharging is never held back. Gymnasium (`mecosim.envs.MecosimEnv`) and PettingZoo (`MecosimParallelEnv`) environments expose the
 hub choice and the energy per stop (continuous, kWh) as actions; `mecosim.mosaik.MecosimSim` is a mosaik simulator.
 
+## Training speed
+
+All options are off by default (`MecosimEnv` keyword arguments and `simulation.*` keys); defaults give the previous
+results. Design details: [docs/architecture.md](docs/architecture.md#training-throughput-opt-in).
+`python benchmarks/rl_throughput.py [episode|reset|steps|vector|kpi]` reproduces the tables; raw CSVs are in
+`benchmarks/results/`.
+
+```python
+from mecosim.envs import MecosimEnv, make_vector_env
+
+env = MecosimEnv(spec, "output/rl", fast_reset=True, control_step_s=900, cache_dir="output/cache")
+vec = make_vector_env(spec, n_envs=8, seed=0)  # one libsumo and one CityLearn per spawned process
+```
+
+| Option | Effect |
+|---|---|
+| `fast_reset=True`, `simulation.warmup_s` | keep CityLearn and SUMO alive, reload SUMO in place from a saved warm state |
+| `simulation.start_offset_max_s` | random delay between warm-up end and master step 0 per episode (ride requests accumulate) |
+| `simulation.profile: train` | no tripinfo/statistics/stop/log output; `run_scenario` marks tripinfo metrics NaN |
+| `control_step_s`, `decision="event"` | master step 900/3600 s; semi-MDP steps at fleet events with `info["dt_s"]` (reference energy only) |
+| `make_vector_env`, `rllib_env_creator` | one process per environment, per-worker seeds |
+| `simulation.mode: meso` | `--mesosim`; needs a SUMO build that keeps fleet taxis (otherwise `FleetVehicleLostError`) |
+
+**Measurements.** The benchmark machine was shared with other heavy jobs (CPU load 100 %, disk and memory pressure),
+so wall times below are inflated and noisy; the CPU-time columns are the reliable ones. Two-zone demo, 1800 s,
+CityLearn energy, median of 5 resets:
+
+| `env.reset()` | wall (s) | CPU (s) | SUMO start/reload (s) | CityLearn and rest (s) |
+|---|---|---|---|---|
+| rebuild each episode (previous) | 2.71 | 1.02 | 0.32 | 2.34 |
+| `fast_reset` | 0.36 | 0.27 | 0.26 | 0.08 |
+| rebuild, `warmup_s=300` | 1.85 | 1.27 | 0.22 | 1.42 |
+| `fast_reset`, `warmup_s=300` | 0.57 | 0.38 | 0.46 | 0.09 |
+| city scenario (reference energy), rebuild / fast | 1.09 / 0.62 | 0.45 / 0.42 | 0.46 / 0.47 | 0.11 / 0.01 |
+
+The reset target of 100 ms is not reached. The SUMO reload (net and route files are parsed again) took 75 ms (plain)
+to 116 ms (warm state) on a quiet machine and 0.26 to 0.46 s under load; the reset also simulates the first 60 s master
+interval (about 60 ms), and CityLearn's own `env.reset()` (not modified) costs about 80 ms. `simulation.loadState` was
+tested and rejected: it drops all persons and vehicles that have not departed (SUMO 1.28), so the ride demand
+disappears. Fast reset reproduces episodes exactly (same actions give the same reward and observation; tested).
+
+| Environment steps (CPU time) | steps per CPU s |
+|---|---|
+| demo, CityLearn, eval profile | 13.9 |
+| demo, CityLearn, train profile | 14.8 |
+| demo, reference energy, train profile | 18.8 |
+| demo, reference energy, `decision="event"` (epochs) | 44.7 |
+| city 12x12, 30 taxis, 4800 bg veh/h, reference energy, eval / train | 1.9 / 1.9 |
+
+Where the time goes (cProfile, demo, 1800 s, reference energy, quiet machine): 0.53 s of 0.57 s in `advance` is SUMO's
+`simulation_step`; all TraCI getters of the observation, the policy and the per-step event queries sum to about 0.04
+s. Subscriptions would save under 0.1 ms per step, and one `simulationStep(until)` cannot see fleet events inside the
+jump, so neither was implemented. SUMO's step is the bound; the levers are fewer or cheaper SUMO steps (smaller network
+or demand, train profile, coarser `mobility_step_s`) and more processes. A quiet-machine A/B of one 1800 s episode gave
+1.02 s (eval) and 0.71 s (train), a single run each. `--routing-algorithm astar` and `--no-internal-links` change
+results and were rejected.
+
+| Vector env (demo, CityLearn, train profile; loaded machine) | env steps/s | sim s / wall s |
+|---|---|---|
+| 1 worker | 13.7 | 822 |
+| 2 workers | 28.7 | 1720 |
+| 4 workers | 23.1 | 1387 |
+| 8 workers | 30.3 | 1815 |
+
+Scaling beyond 2 workers could not be measured here (other jobs used the cores); rerun the `vector` experiment on an
+idle machine.
+
+**Master step 900 s versus 60 s** (demo, CityLearn, 3600 s, same policy parameters; deviation from the 60 s run):
+
+| Policy | Variant | Grid import | Deficit served | Charged | Energy stops | Mean wait |
+|---|---|---|---|---|---|---|
+| greedy_deficit | 900 s master, policy every 60 s | +8.4 % | -5.2 % | -23.5 % | 11 vs 12 | -14.2 % |
+| optimized | 900 s master, policy every 60 s | +6.2 % | -3.7 % | -27.8 % | 10 vs 10 | -9.3 % |
+| both | 900 s master, policy every 900 s | +160 % to +166 % | -100 % | -100 % | 0 | +469 % to +501 % |
+
+With the policy only at master steps (900 s) no vehicle is dispatched in time and no stop starts, so coarse energy
+steps need `simulation.decision_period_s: 60` (decisions every minute, energy every 900 s). Even then charged energy
+deviates by 24 to 28 % because stop timing and the minimum top-up rule are evaluated per master step.
+
 ## Mid-journey stops in SUMO
 
 Verified with SUMO 1.28 (`tests/test_sumo_integration.py`): an energy stop inserted with `vehicle.insertStop` before

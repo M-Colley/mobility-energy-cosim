@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import pickle
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -13,7 +16,7 @@ from mecosim.core.entities import Hub, VehicleSpec, Zone
 from mecosim.paths import absolute
 from mecosim.scenarios.spec import ScenarioSpec
 
-__all__ = ["BuiltScenario", "build_scenario", "PLUG_LENGTH_M"]
+__all__ = ["BuiltScenario", "build_scenario", "build_scenario_cached", "scenario_hash", "PLUG_LENGTH_M"]
 
 #: Stopping length reserved per plug at a hub (vehicle length 5 m + minGap 2.5 m + margin).
 PLUG_LENGTH_M = 8.0
@@ -35,22 +38,36 @@ class BuiltScenario:
     zone_of_edge: dict[str, str] = field(default_factory=dict)
 
     def sumo_args(self, output_dir: Path | None = None, extra: list[str] | None = None) -> list[str]:
-        """SUMO arguments: the config plus output files in ``output_dir``."""
+        """SUMO arguments: the config plus output files in ``output_dir`` (``simulation.profile: eval``).
+
+        ``simulation.profile: train`` writes no tripinfo, statistics, stop output or log and adds
+        :data:`TRAIN_SPEED_ARGS`; ``simulation.mode: meso`` adds ``--mesosim``.
+        """
+        sim = self.spec.simulation
         out = Path(output_dir or self.out_dir / "output")
         out.mkdir(parents=True, exist_ok=True)
-        args = [
-            "-c",
-            str(self.sumocfg),
-            "--tripinfo-output",
-            str(out / "tripinfo.xml"),
-            "--statistic-output",
-            str(out / "statistics.xml"),
-            "--stop-output",
-            str(out / "stops.xml"),
-            "--log",
-            str(out / "sumo.log"),
-        ]
+        args = ["-c", str(self.sumocfg)]
+        if sim.profile == "train":
+            args += TRAIN_SPEED_ARGS
+        else:
+            args += [
+                "--tripinfo-output",
+                str(out / "tripinfo.xml"),
+                "--statistic-output",
+                str(out / "statistics.xml"),
+                "--stop-output",
+                str(out / "stops.xml"),
+                "--log",
+                str(out / "sumo.log"),
+            ]
+        if sim.mode == "meso":
+            args.append("--mesosim")
         return args + list(extra or [])
+
+
+#: SUMO options of ``simulation.profile: train`` (besides dropping all outputs). ``--no-warnings`` only silences the
+#: log; see ``docs/architecture.md`` ("Training profile") for the options that were tested and rejected.
+TRAIN_SPEED_ARGS = ["--no-warnings", "true"]
 
 
 def _run(cmd: list[str], cwd: Path) -> None:
@@ -214,7 +231,7 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
                 hub = zone_hubs[i % len(zone_hubs)]
                 init_wh = arch.initial_soc * arch.capacity_kwh * 1000.0
                 vehicles.append(
-                    f'  <vehicle id={quoteattr(vid)} type={quoteattr(vtype_id)} depart="{sim.begin_s:.1f}" '
+                    f'  <vehicle id={quoteattr(vid)} type={quoteattr(vtype_id)} depart="{sim.episode_begin_s:.1f}" '
                     'line="taxi" departPos="base">\n'
                     f'    <route edges="{hub.edge_id}"/>\n'
                     f'    <param key="device.battery.chargeLevel" value="{init_wh:.3f}"/>\n'
@@ -250,7 +267,8 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
             hub = hub_list[i % len(hub_list)]
             init_wh = fs.initial_soc * fs.capacity_kwh * 1000.0
             vehicles.append(
-                f'  <vehicle id="{vid}" type="av_taxi" depart="{sim.begin_s:.1f}" line="taxi" departPos="base">\n'
+                f'  <vehicle id="{vid}" type="av_taxi" depart="{sim.episode_begin_s:.1f}" line="taxi" '
+                'departPos="base">\n'
                 f'    <route edges="{hub.edge_id}"/>\n'
                 f'    <param key="device.battery.chargeLevel" value="{init_wh:.3f}"/>\n'
                 f"  </vehicle>"
@@ -274,7 +292,8 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
     )
 
     # ---------------------------------------------------------------------------------- demand
-    begin, end = sim.begin_s, sim.begin_s + sim.duration_s
+    begin = sim.episode_begin_s
+    end = begin + sim.start_offset_max_s + sim.duration_s
     random_trips = str(sumo_tool("randomTrips.py"))
     person_file = out / "persons.rou.xml"
     _run(
@@ -316,7 +335,7 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
                 "-p",
                 str(spec.demand.background_period_s),
                 "-b",
-                str(begin),
+                str(sim.begin_s),
                 "-e",
                 str(end),
                 "--fringe-factor",
@@ -344,7 +363,7 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
     <additional-files value={quoteattr(str(add_file))}/>
   </input>
   <time>
-    <begin value="{begin}"/>
+    <begin value="{sim.begin_s}"/>
     <step-length value="{sim.mobility_step_s}"/>
   </time>
   <processing>
@@ -369,3 +388,43 @@ def build_scenario(spec: ScenarioSpec, out_dir: str | Path) -> BuiltScenario:
     )
     zones = {z.id: Zone(z.id, z.role, z.pv_scale, tuple(z.buildings)) for z in spec.zones}
     return BuiltScenario(spec, out, net_file, cfg, route_files, [add_file], hubs, zones, fleet, zone_of_edge)
+
+
+def scenario_hash(spec: ScenarioSpec) -> str:
+    """Hash of the parts of ``spec`` that change the generated files (network, hubs, fleet, demand, timing, seed).
+
+    Energy, session and reserve settings and the ``profile``/``mode`` switches only change run-time arguments, so they
+    are excluded and share one build.
+    """
+    data = spec.model_dump(mode="json")
+    for key in ("energy", "session", "reserve"):
+        data.pop(key, None)
+    data["simulation"] = {k: v for k, v in data["simulation"].items() if k not in ("profile", "mode")}
+    payload = json.dumps(data, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def build_scenario_cached(spec: ScenarioSpec, cache_dir: str | Path) -> BuiltScenario:
+    """:func:`build_scenario` into ``cache_dir/<hash>``, reused when the same spec was built before.
+
+    The returned scenario carries ``spec`` (not the cached one), so run-time-only differences are preserved.
+    """
+    from dataclasses import replace
+
+    out = absolute(cache_dir) / scenario_hash(spec)
+    pkl = out / "built.pkl"
+    if pkl.exists():
+        try:
+            with open(pkl, "rb") as fh:
+                cached: BuiltScenario = pickle.load(fh)
+            files = [cached.net_file, cached.sumocfg, *cached.route_files, *cached.additional_files]
+            if all(Path(p).exists() for p in files):
+                return replace(cached, spec=spec)
+        except (OSError, pickle.UnpicklingError, AttributeError, EOFError):
+            pass
+    built = build_scenario(spec, out)
+    tmp = out / f"built.pkl.{id(built)}.tmp"
+    with open(tmp, "wb") as fh:
+        pickle.dump(built, fh)
+    tmp.replace(pkl)  # atomic: concurrent workers never read a partial file
+    return built
